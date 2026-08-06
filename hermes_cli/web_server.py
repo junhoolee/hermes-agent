@@ -48,6 +48,13 @@ import urllib.parse
 import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_cli.claude_code import (
+    CLAUDE_CODE_DISPLAY_NAME,
+    CLAUDE_CODE_PROVIDER_ID,
+    CLAUDE_DOCS_URL,
+    CLAUDE_LOGIN_COMMAND,
+    CLAUDE_LOGOUT_COMMAND,
+)
 from hermes_cli.install_identity import get_install_id as _shared_get_install_id
 import urllib.request
 from pathlib import Path
@@ -1527,6 +1534,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # `session.terminal_continue` is the only schema-surfaced session field —
     # fold it into general rather than spawning a one-field orphan category.
     "session": "general",
+    # `claude_subscription.enabled` is a release gate for the Claude Agent SDK
+    # runtime, not a settings group, and it is the section's only field — fold
+    # it into the agent tab rather than spawning a one-field orphan category.
+    "claude_subscription": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -11049,27 +11060,31 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
 
 
 def _claude_code_only_status() -> Dict[str, Any]:
-    """Surface Claude Code CLI credentials as their own provider entry.
+    """Status for the Claude subscription card, from the official CLI.
 
-    Independent of the Anthropic entry above so users can see whether their
-    Claude Code subscription tokens are actively flowing into Hermes even
-    when they also have a separate Hermes-managed PKCE login.
+    Asks ``claude auth status`` whether a login exists; it never reads,
+    writes, or previews a Claude credential — the Claude Agent SDK owns them.
+    ``token_preview`` is therefore always None, and ``source_label`` carries
+    the CLI's own account/auth-method summary so the UI can distinguish a
+    claude.ai plan login (subscription billing) from an API-key login (metered
+    API billing), which are not the same thing.
     """
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
-        creds = read_claude_code_credentials()
-    except Exception:
-        creds = None
-    if creds and creds.get("accessToken"):
-        return {
-            "logged_in": True,
-            "source": "claude_code_cli",
-            "source_label": "~/.claude/.credentials.json",
-            "token_preview": _truncate_token(creds.get("accessToken")),
-            "expires_at": creds.get("expiresAt"),
-            "has_refresh_token": bool(creds.get("refreshToken")),
-        }
-    return {"logged_in": False, "source": None}
+        from hermes_cli.claude_code import provider_status
+        status = provider_status()
+    except Exception as exc:
+        return {"logged_in": False, "source": "claude_cli", "error": str(exc)}
+    return {
+        "logged_in": bool(status.get("logged_in")) and bool(status.get("subscription")),
+        "source": "claude_cli",
+        "source_label": status.get("message") or "Managed by the Claude CLI",
+        "token_preview": None,  # Hermes never holds a Claude credential.
+        "expires_at": None,
+        "has_refresh_token": False,
+        "auth_method": status.get("auth_method", ""),
+        "subscription": bool(status.get("subscription")),
+        "cli_version": status.get("cli_version", ""),
+    }
 
 
 def _copilot_acp_status() -> Dict[str, Any]:
@@ -11095,9 +11110,10 @@ def _copilot_acp_status() -> Dict[str, Any]:
 # display order. They are the OVERRIDE BASE for ``_build_oauth_catalog()``,
 # which unions them with every accounts-tab provider in ``provider_catalog()``
 # so newly-added OAuth/external providers appear automatically (no hand edit).
-# This tuple also still includes two entries that are NOT catalog providers but
-# must show on the Accounts tab: the Anthropic credential-status card and the
-# synthetic ``claude-code`` subscription row.
+# This tuple also still includes the Anthropic credential-status card, which is
+# not a catalog provider but must show on the Accounts tab, and pins the
+# metadata for ``claude-code`` (a catalog provider only once the Claude
+# subscription gate is open) so its card renders identically either way.
 # ``flow`` describes the account-management shape so the UI can pick the right
 # behavior: ``device_code`` = show code + verification URL + poll, and
 # ``external`` = read-only/delegated to a terminal or third-party CLI.
@@ -11158,13 +11174,16 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "docs_url": "https://docs.github.com/en/copilot",
         "status_fn": _copilot_acp_status,
     },
-    # ── Anthropic / Claude entries sit at the bottom.
+    # ── Anthropic / Claude entries sit at the bottom: the API-key path
+    # first, then the Claude subscription (Agent SDK) path. They are billed
+    # differently — API tokens vs. the user's Claude plan — so the copy must
+    # keep them distinguishable.
     #
-    # This card is deliberately flow == "external" (no in-dashboard "Connect"
-    # button walking the user through claude.ai/oauth/authorize from the web
-    # server). Hermes previously reimplemented that subscription-OAuth PKCE
-    # dance itself for the dashboard (issues #87887/#87888); that surface was
-    # removed because it lets an unattended, scriptable HTTP endpoint mint
+    # The API-key card is deliberately flow == "external" (no in-dashboard
+    # "Connect" button walking the user through claude.ai/oauth/authorize from
+    # the web server). Hermes previously reimplemented that subscription-OAuth
+    # PKCE dance itself for the dashboard (issues #87887/#87888); that surface
+    # was removed because it lets an unattended, scriptable HTTP endpoint mint
     # Claude Pro/Max subscription tokens outside Anthropic's own client,
     # which sits on the wrong side of Anthropic's usage policies for OAuth
     # credentials. Login still works via the terminal (`hermes auth add
@@ -11178,11 +11197,11 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": _anthropic_oauth_status,
     },
     {
-        "id": "claude-code",
-        "name": "Anthropic OAuth: Required Extra Usage Credits to Use Subscription",
+        "id": CLAUDE_CODE_PROVIDER_ID,
+        "name": CLAUDE_CODE_DISPLAY_NAME,
         "flow": "external",
-        "cli_command": "claude setup-token",
-        "docs_url": "https://docs.claude.com/en/docs/claude-code",
+        "cli_command": CLAUDE_LOGIN_COMMAND,
+        "docs_url": CLAUDE_DOCS_URL,
         "status_fn": _claude_code_only_status,
     },
 )
@@ -11293,19 +11312,17 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
     instead hand the GUI a command it can *run in the embedded terminal* — the
     user sees exactly what executes, and Hermes then stops resolving the token.
 
-    Claude Code has no scriptable logout (only the interactive ``/logout``), so
-    we remove the credential the same way logout does: the macOS Keychain entry
-    (``Claude Code-credentials``) and/or the ``~/.claude/.credentials.json``
-    file — the two sources ``read_claude_code_credentials()`` consults. Returns
-    None for providers we can't safely clear (the GUI shows a manual hint).
+    For the Claude subscription that command is the CLI's own
+    ``claude auth logout``. Hermes must never delete or rewrite Anthropic's
+    credential store itself — the CLI owns those files and the keychain entry,
+    and reaching into them is exactly the boundary this provider exists to
+    respect. Returns None for providers we can't safely clear (the GUI shows a
+    manual hint).
     """
     if provider.get("flow") != "external":
         return None
-    if provider.get("id") == "claude-code":
-        rm_file = "rm -f ~/.claude/.credentials.json"
-        if sys.platform == "darwin":
-            return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
-        return rm_file
+    if provider.get("id") == CLAUDE_CODE_PROVIDER_ID:
+        return CLAUDE_LOGOUT_COMMAND
     return None
 
 
@@ -11335,8 +11352,7 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
     MEMBERSHIP is the union of:
       1. ``_OAUTH_PROVIDER_CATALOG`` — the explicit, hand-tuned cards that carry
          bespoke flow / status_fn / cli_command (including the api-key Anthropic
-         PKCE card and the synthetic claude-code subscription row, which are not
-         catalog providers), and
+         PKCE card, which is not a catalog provider), and
       2. every accounts-tab provider in the unified ``provider_catalog()`` (the
          ``hermes model`` universe) — so any OAuth/external provider added as a
          plugin appears automatically, with sensible defaults, even if no

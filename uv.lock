@@ -35,6 +35,7 @@ openwakeword = false
 defusedxml = false
 ruff = false
 exa-py = false
+claude-agent-sdk = "2026-08-19T00:00:00Z"
 mcp = false
 python-olm = false
 wheel = false
@@ -810,6 +811,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/26/b9924fa27db384bdcd97ab83b4f0a8058d96ad9626ead570674d5e737d90/charset_normalizer-3.4.4-cp313-cp313-win_amd64.whl", hash = "sha256:b435cba5f4f750aa6c0a0d92c541fb79f69a387c91e61f1795227e4ed9cece14", size = 107092, upload-time = "2025-10-14T04:41:31.188Z" },
     { url = "https://files.pythonhosted.org/packages/af/8f/3ed4bfa0c0c72a7ca17f0380cd9e4dd842b09f664e780c13cff1dcf2ef1b/charset_normalizer-3.4.4-cp313-cp313-win_arm64.whl", hash = "sha256:542d2cee80be6f80247095cc36c418f7bddd14f4a6de45af91dfad36d817bba2", size = 100408, upload-time = "2025-10-14T04:41:32.624Z" },
     { url = "https://files.pythonhosted.org/packages/0a/4c/925909008ed5a988ccbb72dcc897407e5d6d3bd72410d69e051fc0c14647/charset_normalizer-3.4.4-py3-none-any.whl", hash = "sha256:7a32c560861a02ff789ad905a2fe94e3f840803362c84fecf1851cb4cf3dc37f", size = 53402, upload-time = "2025-10-14T04:42:31.76Z" },
+]
+
+[[package]]
+name = "claude-agent-sdk"
+version = "0.2.140"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "jsonschema" },
+    { name = "mcp" },
+    { name = "sniffio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/64/7e/8157c0fdb982f865c4ce1cb1fc1eeb2ad8fba427fe5f3df78e3498ff6d2f/claude_agent_sdk-0.2.140.tar.gz", hash = "sha256:93b646e34bb39e37c868d67dc736de29a655529a4c986857e83a9d5bcf1f4e2b", size = 344707, upload-time = "2026-08-18T20:56:47.048Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/9d/012976d8e3836dabb75212c46473cb2ae650fcd6faa3040c0c18810e21b2/claude_agent_sdk-0.2.140-py3-none-macosx_11_0_arm64.whl", hash = "sha256:1eb420b70b431351b7f807e28f635754367e9509d7b57878016b6a88efbbbf1d", size = 89856476, upload-time = "2026-08-18T20:56:52.27Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/b9/51bd78ac29b4df81a310c5fa5cd2f1205d149497034a61ffb2f273ecada2/claude_agent_sdk-0.2.140-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:da83b7657728f4a12f90b147743c7b3bd292adbadfd11b6b235789b68b5e3058", size = 94764368, upload-time = "2026-08-18T20:56:57.352Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/c0/c278fcab903587798976a29fbcc67aab6d1dc4b2b4023107e1f9f13a26ed/claude_agent_sdk-0.2.140-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:b55ed0333ba235e992455f990ec5cea557736fb9207c73878b96876a4cdb1c15", size = 99183268, upload-time = "2026-08-18T20:57:02.422Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/4b/0a6a80d00f01168957daf5ed3c32323839b5ee21e953ccf7b8db37a0525c/claude_agent_sdk-0.2.140-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:a873fd3f7378a6320b73193a1502115979567f9b52ea1f25dc225e69cd4a2920", size = 100180869, upload-time = "2026-08-18T20:57:07.985Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/5c/abbdffb94dcc7b8a741621fbdfbd2ffc90e5e7f976e1cc9735ae8ae851ad/claude_agent_sdk-0.2.140-py3-none-win_amd64.whl", hash = "sha256:c3feb45d7dc7564b66e161fcb9ea976e39faae40a64d429137cb0d85fb955e1f", size = 102371936, upload-time = "2026-08-18T20:57:13.222Z" },
 ]
 
 [[package]]
@@ -1739,6 +1759,9 @@ azure-identity = [
 bedrock = [
     { name = "boto3" },
 ]
+claude-code = [
+    { name = "claude-agent-sdk" },
+]
 computer-use = [
     { name = "httpx2" },
     { name = "mcp" },
@@ -1930,6 +1953,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.1" },
     { name = "certifi", specifier = "==2026.5.20" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude-code'", specifier = ">=0.2.140,<0.4" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==50.0.0" },
@@ -2051,7 +2075,7 @@ requires-dist = [
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["anthropic", "claude-code", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "vercel", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [[package]]
 name = "hf-xet"
