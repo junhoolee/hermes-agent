@@ -12,6 +12,7 @@ from hermes_cli.claude_subscription import (
     CLAUDE_CLI_MIN_VERSION,
     claude_agent_sdk_available,
     claude_subscription_enabled,
+    claude_subscription_start_timeout,
 )
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -67,6 +68,33 @@ def test_availability_probe_swallows_a_broken_import_system(monkeypatch):
         assert claude_agent_sdk_available() is False
     finally:
         claude_agent_sdk_available.cache_clear()
+
+
+def test_start_timeout_reads_the_configured_seconds():
+    assert claude_subscription_start_timeout(
+        {"claude_subscription": {"start_timeout": 120}}
+    ) == 120.0
+    assert claude_subscription_start_timeout(
+        {"claude_subscription": {"start_timeout": "90"}}
+    ) == 90.0
+
+
+def test_start_timeout_is_none_when_unset_so_the_runtime_default_applies():
+    assert claude_subscription_start_timeout(None) is None
+    assert claude_subscription_start_timeout({}) is None
+    assert claude_subscription_start_timeout({"claude_subscription": {}}) is None
+    assert claude_subscription_start_timeout(DEFAULT_CONFIG) is None
+
+
+def test_start_timeout_rejects_malformed_values_without_raising():
+    """Zero, negative, and non-numeric values read as 'use the default' — a
+    hand-edited config.yaml must never wedge session startup."""
+    for value in (0, -5, "soon", None, [], {}, False):
+        assert claude_subscription_start_timeout(
+            {"claude_subscription": {"start_timeout": value}}
+        ) is None
+    for config in ("not-a-dict", [], 0, {"claude_subscription": "yes"}):
+        assert claude_subscription_start_timeout(config) is None
 
 
 def test_pinned_versions_are_orderable_version_strings():
