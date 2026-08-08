@@ -241,12 +241,21 @@ def build_bridged_sdk_tools(
                 )
 
             async def _handler(call_args: dict[str, Any]) -> dict[str, Any]:
-                # propagate_context_to_thread carries the turn's ContextVars
-                # and thread-local approval/sudo callbacks into the worker,
-                # the same way the concurrent executor does.
-                return await asyncio.to_thread(
-                    propagate_context_to_thread(_invoke), call_args or {},
+                # This coroutine runs on the SDK-owned loop thread, which has
+                # neither the turn's ContextVars nor the thread-local
+                # approval/sudo callbacks — a call-time capture here hands the
+                # worker an EMPTY approval context, so the gateway approval
+                # gate stops recognising the session and dangerous commands
+                # fall into the non-interactive auto-approve branch.  The
+                # runtime snapshots the Hermes turn thread's context each turn
+                # (claude_runtime._ensure_session) and stores it on the agent;
+                # capturing at call time is only correct for direct callers
+                # that invoke the handler from the turn thread itself.
+                wrap = (
+                    getattr(agent, "_claude_bridge_context", None)
+                    or propagate_context_to_thread
                 )
+                return await asyncio.to_thread(wrap(_invoke), call_args or {})
 
             _handler.__name__ = name
             return _handler

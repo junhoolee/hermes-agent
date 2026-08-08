@@ -3022,6 +3022,11 @@ DEFAULT_CONFIG = {
         # is only sanctioned for private validation against a
         # developer-controlled, consenting Claude account.
         "enabled": False,
+        # Seconds the runtime waits for the Claude CLI child to spawn,
+        # connect, and (on resume) re-materialize the mirrored transcript.
+        # 0 = the built-in default (60s). Raise on slow hardware where a
+        # cold resume of a large session exceeds a minute.
+        "start_timeout": 0,
     },
 
     # Config schema version - bump this when adding new required fields

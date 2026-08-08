@@ -891,3 +891,64 @@ def test_the_early_branch_fires_for_claude_agent_sdk():
     assert result["final_response"] == "claude"
     # The default provider loop was bypassed entirely.
     assert result["api_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Session start timeout is configurable
+# ---------------------------------------------------------------------------
+
+
+class _CapturingSession:
+    """Stands in for ClaudeAgentSession; records constructor kwargs."""
+
+    last_kwargs: dict = {}
+
+    def __init__(self, **kwargs):
+        type(self).last_kwargs = kwargs
+        self.closed = False
+
+    def ensure_started(self):
+        pass
+
+
+def _ensure_session_with_config(monkeypatch, config: dict):
+    from agent.transports import claude_agent_session as session_mod
+
+    monkeypatch.setattr(session_mod, "ClaudeAgentSession", _CapturingSession)
+    _CapturingSession.last_kwargs = {}
+    agent = _make_agent("web_search")
+    agent._cached_system_prompt = "hermes system prompt"
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        claude_runtime._ensure_session(agent, "task-timeout")
+    return _CapturingSession.last_kwargs
+
+
+def test_start_timeout_follows_claude_subscription_config(monkeypatch):
+    """`claude_subscription.start_timeout` must reach the session — a 60s
+    hardcode is what let a cold resume of a large session on slow hardware
+    blow the startup deadline (2026-08-09 stall incident)."""
+    kwargs = _ensure_session_with_config(
+        monkeypatch,
+        {"claude_subscription": {"enabled": True, "start_timeout": 120}},
+    )
+    assert kwargs.get("start_timeout") == 120.0
+
+
+def test_start_timeout_defaults_to_60_seconds_when_not_configured(monkeypatch):
+    kwargs = _ensure_session_with_config(
+        monkeypatch, {"claude_subscription": {"enabled": True}}
+    )
+    # Omitted, so ClaudeAgentSession's own default applies.
+    assert "start_timeout" not in kwargs
+
+    from agent.transports.claude_agent_session import DEFAULT_START_TIMEOUT_SECONDS
+
+    assert DEFAULT_START_TIMEOUT_SECONDS == 60.0
+
+
+def test_start_timeout_ignores_a_malformed_config_value(monkeypatch):
+    kwargs = _ensure_session_with_config(
+        monkeypatch,
+        {"claude_subscription": {"enabled": True, "start_timeout": "soon"}},
+    )
+    assert "start_timeout" not in kwargs
