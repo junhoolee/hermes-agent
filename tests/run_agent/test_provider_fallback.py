@@ -345,3 +345,152 @@ class TestFallbackChainDedup:
         assert called == [("xai", "grok-4.5")]
         assert agent.provider == "xai"
         assert agent.model == "grok-4.5"
+
+
+# ── Claude subscription (claude_agent_sdk) fallback entries ───────────────
+
+
+class TestClaudeAgentSdkFallback:
+    """A `claude-code` chain entry must activate the Claude subscription
+    runtime, and leaving it must release the live SDK session — mirrors
+    what switch_model() already does for the /model command path."""
+
+    def test_claude_code_entry_activates_the_sdk_runtime(self):
+        """A `claude-code` chain entry must select the claude_agent_sdk
+        runtime, not install the auxiliary one-shot adapter as the main
+        OpenAI client (which hard-fails every fallback turn on
+        "runs with no tools")."""
+        fbs = [{"provider": "claude-code", "model": "claude-sonnet-5"}]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "hermes_cli.claude_code.subscription_enabled",
+                new=lambda config=None: True,
+            ),
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="claude-sdk://subscription", api_key=""),
+                    "claude-sonnet-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "claude_agent_sdk"
+        assert agent.provider == "claude-code"
+        assert agent.model == "claude-sonnet-5"
+        # No HTTP client: the SDK owns auth and transport itself.
+        assert agent.client is None
+        assert agent._client_kwargs == {}
+
+    def test_entry_declared_api_mode_is_honored(self):
+        """`hermes fallback add` writes api_mode into the chain entry —
+        activation must honor it instead of re-deriving from the base URL."""
+        fbs = [
+            {
+                "provider": "claude-code",
+                "model": "claude-sonnet-5",
+                "api_mode": "claude_agent_sdk",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="claude-sdk://subscription", api_key=""),
+                    "claude-sonnet-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "claude_agent_sdk"
+        assert agent.client is None
+        assert agent._client_kwargs == {}
+
+    def test_leaving_the_sdk_runtime_releases_the_session(self):
+        """Advancing the chain away from claude-code must release the live
+        SDK session (loop thread + Claude Code subprocess) the same way
+        switch_model() does, or both leak."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.api_mode = "claude_agent_sdk"
+        agent.provider = "claude-code"
+        agent.model = "claude-sonnet-5"
+        agent.base_url = "claude-sdk://subscription"
+        agent._release_claude_agent_sdk_session = MagicMock()
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "glm-4.7"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        agent._release_claude_agent_sdk_session.assert_called_once()
+        assert agent.api_mode == "chat_completions"
+
+    def test_gate_closed_claude_code_uses_anthropic_wire_with_oauth_detection(self):
+        """While the subscription gate is shut, claude-code still means the
+        legacy anthropic path — and the OAuth-token detection must apply to
+        the aliased slug, not only the literal string "anthropic"."""
+        fbs = [{"provider": "claude-code", "model": "claude-sonnet-5"}]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "hermes_cli.claude_code.subscription_enabled",
+                new=lambda config=None: False,
+            ),
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(
+                        base_url="https://api.anthropic.com",
+                        api_key="sk-ant-oat01-test-token",
+                    ),
+                    "claude-sonnet-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(name="anthropic-client"),
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "anthropic_messages"
+        assert agent._is_anthropic_oauth is True
