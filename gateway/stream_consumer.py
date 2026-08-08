@@ -709,6 +709,10 @@ class GatewayStreamConsumer:
                 # Abandon the stream early if the session has been reset
                 # (e.g. /new or /stop). Prevents stale deltas from being
                 # delivered after the user has already moved on.
+                # NOTE: this return flows through the finally block below,
+                # which rescues any still-queued (_COMMENTARY, text) items —
+                # completed user-facing prose — instead of silently dropping
+                # them with the rest of the queue (known-issues/05).
                 if not self._run_still_current():
                     return
 
@@ -1085,25 +1089,69 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
-            # Safety net: if run() exits (normal return, cancellation, or
-            # exception) while a _FLUSH barrier is still queued or was consumed
-            # but not yet signaled, wake any waiters now. Without this a caller
-            # blocked in flush_pending_sync() would stall the full timeout when
-            # the consumer dies mid-flush. Bounded either way, but this makes
-            # the common case instant instead of timeout-delayed.
+            # Safety net with two jobs:
+            #
+            # 1. Rescue queued commentary. If run() exits while
+            #    (_COMMENTARY, text) items are still queued — most notably the
+            #    stale-generation early return at the top of the drain loop,
+            #    when a new inbound message (e.g. a synthetic
+            #    [ASYNC DELEGATION COMPLETE] event) bumped run_generation
+            #    mid-turn — those items are completed, user-facing assistant
+            #    prose that would otherwise be discarded without any adapter
+            #    call ever happening (known-issues/05: commentary text drop).
+            #    Deliver them late via the normal _send_commentary path
+            #    rather than drop them: late is recoverable, silent loss is
+            #    not. On the normal got_done exit the queue holds no
+            #    commentary (FIFO drain), so this is a no-op there.
+            #
+            # 2. Signal _FLUSH barriers: if a barrier is still queued or was
+            #    consumed but not yet signaled, wake any waiters now. Without
+            #    this a caller blocked in flush_pending_sync() would stall the
+            #    full timeout when the consumer dies mid-flush. Signaled AFTER
+            #    the commentary sends so the barrier keeps its "everything
+            #    queued before me was delivered" meaning on these exit paths.
+            pending_commentary: list = []
+            flush_events: list = []
             try:
                 while True:
                     item = self._queue.get_nowait()
-                    if (
-                        isinstance(item, tuple)
-                        and len(item) == 2
-                        and item[0] is _FLUSH
-                    ):
-                        self._signal_flush(item[1])
+                    if not (isinstance(item, tuple) and len(item) == 2):
+                        continue
+                    if item[0] is _FLUSH:
+                        flush_events.append(item[1])
+                    elif item[0] is _COMMENTARY:
+                        pending_commentary.append(item[1])
             except queue.Empty:
                 pass
             except Exception:
                 pass
+            for idx, text in enumerate(pending_commentary):
+                try:
+                    logger.warning(
+                        "Flushing %d-char queued commentary on consumer exit "
+                        "(stale-return/cancel/error path) — known-issues/05",
+                        len(text or ""),
+                    )
+                    await self._send_commentary(text)
+                except asyncio.CancelledError:
+                    # Cancelled again while flushing — stop attempting sends
+                    # (the loop may be shutting down) but still wake flush
+                    # waiters below. Swallowing here matches the pre-existing
+                    # except-CancelledError handler above, which also does
+                    # best-effort delivery without re-raising.
+                    logger.warning(
+                        "Cancelled while flushing queued commentary on exit; "
+                        "%d item(s) not delivered",
+                        len(pending_commentary) - idx,
+                    )
+                    break
+                except Exception:
+                    logger.error(
+                        "Failed to flush queued commentary on consumer exit",
+                        exc_info=True,
+                    )
+            for evt in flush_events:
+                self._signal_flush(evt)
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose

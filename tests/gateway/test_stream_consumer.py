@@ -1,12 +1,17 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.stream_consumer import (
+    GatewayStreamConsumer,
+    StreamConsumerConfig,
+    _FLUSH,
+)
 
 
 def test_stream_send_metadata_carries_original_reply_anchor():
@@ -1487,4 +1492,153 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
+
+
+# ── Stale-return commentary flush regression tests ───────────────────────
+# Regression guard for known-issue wiki/known-issues/05 ("commentary text
+# drop during tool progress"): when run_still_current() flips to stale,
+# run() must not silently drop commentary that is still sitting in
+# self._queue — it has to be flushed (via _send_commentary in the finally
+# block) before the consumer exits, so the user still receives interim
+# explanations even though the turn itself is abandoned as stale.
+
+
+class TestStaleReturnCommentaryFlush:
+    """Verify queued commentary is flushed, not silently dropped, when
+    run_still_current() reports the turn is stale (wiki known-issues/05:
+    commentary text drop during tool progress)."""
+
+    @pytest.mark.asyncio
+    async def test_queued_commentary_flushed_on_stale_return(self):
+        """A single queued commentary item must still reach adapter.send
+        even though the run is stale from the very first loop iteration."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=3)
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", config,
+            run_still_current=lambda: False,
+        )
+
+        consumer.on_commentary("interim explanation the user must still receive")
+
+        await consumer.run()
+
+        assert adapter.send.call_count == 1
+        assert (
+            "interim explanation the user must still receive"
+            in adapter.send.call_args_list[0][1]["content"]
+        )
+        # A rescued commentary is an interim status update, not the final
+        # response — it must not mark the turn as delivered.
+        assert consumer._final_response_sent is False
+
+    @pytest.mark.asyncio
+    async def test_multiple_queued_commentary_flushed_in_order_on_stale_return(self):
+        """Multiple queued commentary items must all be flushed, in the
+        FIFO order they were enqueued, when the run is stale."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=3)
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", config,
+            run_still_current=lambda: False,
+        )
+
+        consumer.on_commentary("first commentary")
+        consumer.on_commentary("second commentary")
+
+        await consumer.run()
+
+        sent_contents = [
+            call.kwargs["content"] for call in adapter.send.call_args_list
+        ]
+        assert any("first commentary" in c for c in sent_contents)
+        assert any("second commentary" in c for c in sent_contents)
+        first_idx = next(
+            i for i, c in enumerate(sent_contents) if "first commentary" in c
+        )
+        second_idx = next(
+            i for i, c in enumerate(sent_contents) if "second commentary" in c
+        )
+        assert first_idx < second_idx, (
+            f"commentary flushed out of FIFO order: {sent_contents!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_return_still_signals_flush_barrier_after_commentary(self):
+        """A _FLUSH barrier queued behind commentary must still be signaled
+        (existing safety-net behavior) AND the commentary ahead of it must
+        still be delivered — the stale-return rescue must not regress the
+        flush-barrier guarantee."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=3)
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", config,
+            run_still_current=lambda: False,
+        )
+
+        consumer.on_commentary("interim explanation before the barrier")
+        evt = threading.Event()
+        consumer._queue.put((_FLUSH, evt))
+
+        await consumer.run()
+
+        assert evt.is_set(), "flush barrier was not signaled on stale return"
+        sent_contents = [
+            call.kwargs["content"] for call in adapter.send.call_args_list
+        ]
+        assert any(
+            "interim explanation before the barrier" in c for c in sent_contents
+        )
+
+    @pytest.mark.asyncio
+    async def test_queued_commentary_not_sent_twice_when_already_dequeued_normally(
+        self,
+    ):
+        """Control: when the run stays current, commentary is dequeued and
+        sent by the normal loop body. The finally-block rescue must not
+        also re-send it — no duplicate delivery."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1")
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=3)
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", config,
+            run_still_current=lambda: True,
+        )
+
+        consumer.on_commentary("hello commentary")
+        consumer.finish()
+
+        await consumer.run()
+
+        sent_contents = [
+            call.kwargs["content"] for call in adapter.send.call_args_list
+        ]
+        matches = [c for c in sent_contents if "hello commentary" in c]
+        assert len(matches) == 1, (
+            f"commentary sent {len(matches)} times, expected exactly once: "
+            f"{sent_contents!r}"
+        )
 
