@@ -276,6 +276,206 @@ def test_denied_tool_call_never_dispatches_and_reports_an_error(sdk_module):
 
 
 # ---------------------------------------------------------------------------
+# Approval context on the SDK loop thread
+# ---------------------------------------------------------------------------
+
+
+class _FakeAgentSession:
+    """Stands in for ClaudeAgentSession so _ensure_session never spawns a CLI."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.closed = False
+
+    def ensure_started(self):
+        pass
+
+
+def _run_handler_like_the_sdk_loop(handler, call_args, *, count: int = 1):
+    """Drive *handler* the way the SDK does: as tasks on a foreign event-loop
+    thread whose context carries no gateway ContextVars.
+
+    ``asyncio.run(handler(...))`` on the test thread inherits the test
+    thread's ContextVars and masks their loss — that is exactly how the
+    original suite missed the auto-approve regression. The real handler runs
+    in a task spawned by the SDK's reader on the session-owned loop thread,
+    where the gateway's per-turn ``copy_context()`` never propagated; an
+    explicit empty ``contextvars.Context`` reproduces that.
+    """
+    import contextvars
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    outcomes = []
+    done = threading.Event()
+
+    def _spawn():
+        tasks = [loop.create_task(handler(dict(call_args))) for _ in range(count)]
+
+        def _finish(task):
+            try:
+                outcomes.append(task.result())
+            except BaseException as exc:  # surfaced to the test below
+                outcomes.append(exc)
+            if len(outcomes) == count:
+                done.set()
+
+        for task in tasks:
+            task.add_done_callback(_finish)
+
+    loop.call_soon_threadsafe(_spawn, context=contextvars.Context())
+    try:
+        assert done.wait(30), "bridged handler never completed"
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        return outcomes
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+
+
+def _outcome_for(tool_call, result: str):
+    from agent.tool_executor import ToolExecutionOutcome
+
+    return ToolExecutionOutcome(
+        tool_call=tool_call,
+        tool_call_id=tool_call.id,
+        function_name=tool_call.function.name,
+        function_args={},
+        result=result,
+        duration=0.0,
+        is_error=False,
+        blocked=False,
+        cancelled=False,
+        malformed=False,
+        middleware_trace=[],
+    )
+
+
+def test_gateway_approval_context_reaches_a_handler_on_the_sdk_loop_thread(
+    sdk_module, monkeypatch
+):
+    """A dangerous command dispatched by the bridge must hit the gateway
+    approval flow, never the non-interactive auto-approve branch.
+
+    The gateway binds session identity purely via ContextVars on the Hermes
+    turn thread; the SDK invokes bridge handlers on its own loop thread where
+    those vars were never set. A call-time ``propagate_context_to_thread``
+    there snapshots an EMPTY context, ``_is_gateway_approval_context()`` goes
+    False, and ``_run_approval_gate`` auto-approves the dangerous command with
+    only a log warning. The runtime must capture the turn thread's context
+    (in ``_ensure_session``) and the handler must dispatch under that
+    snapshot.
+    """
+    from agent import claude_runtime
+    from agent.transports import claude_agent_session as session_mod
+    from gateway.session_context import _SESSION_PLATFORM
+    from tools import approval
+
+    monkeypatch.setattr(session_mod, "ClaudeAgentSession", _FakeAgentSession)
+
+    agent = _make_agent("terminal")
+    agent._cached_system_prompt = "hermes system prompt"
+
+    session_key = "test-bridge-approval-ctx"
+    observed = {}
+
+    def _fake_execute_one_tool(bound_agent, tool_call, task_id, **kwargs):
+        # Runs on the bridge's worker thread, like the real executor stack.
+        observed["is_gateway"] = approval._is_gateway_approval_context()
+        observed["gate"] = approval.check_dangerous_command(
+            "rm -rf /tmp/hermes-bridge-test", "local"
+        )
+        return _outcome_for(tool_call, json.dumps({"ok": True}))
+
+    platform_token = _SESSION_PLATFORM.set("slack")
+    key_token = approval.set_current_session_key(session_key)
+    try:
+        # The turn thread's half of the contract: exactly what
+        # run_claude_agent_sdk_turn does before the SDK owns the turn.
+        claude_runtime._ensure_session(agent, "task-approval")
+        tools = bridge.build_bridged_sdk_tools(agent, "task-approval")
+        handler = _tools_by_name(tools)["terminal"].handler
+        with (
+            patch.object(
+                bridge, "execute_one_tool", side_effect=_fake_execute_one_tool
+            ),
+            patch.object(
+                bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result
+            ),
+        ):
+            _run_handler_like_the_sdk_loop(handler, {"command": "ls"})
+    finally:
+        approval.reset_current_session_key(key_token)
+        _SESSION_PLATFORM.reset(platform_token)
+        approval.clear_session(session_key)
+
+    assert observed["is_gateway"] is True, (
+        "bridged tool dispatch lost the gateway approval context on the SDK "
+        "loop thread"
+    )
+    gate = observed["gate"]
+    assert gate["approved"] is False, (
+        f"dangerous command was auto-approved instead of gated: {gate!r}"
+    )
+    assert gate.get("status") == "approval_required"
+
+
+def test_the_stored_context_snapshot_survives_parallel_tool_calls(
+    sdk_module, monkeypatch
+):
+    """Claude batches read-only tools in parallel; one per-turn snapshot must
+    serve concurrent workers (a shared ``contextvars.Context`` object raises
+    "cannot enter context" when entered twice at once)."""
+    from agent import claude_runtime
+    from agent.transports import claude_agent_session as session_mod
+    from gateway.session_context import _SESSION_PLATFORM
+    from tools import approval
+
+    monkeypatch.setattr(session_mod, "ClaudeAgentSession", _FakeAgentSession)
+
+    agent = _make_agent("web_search")
+    agent._cached_system_prompt = "hermes system prompt"
+
+    import threading
+
+    started = threading.Barrier(2, timeout=10)
+    platforms = []
+
+    def _fake_execute_one_tool(bound_agent, tool_call, task_id, **kwargs):
+        started.wait()  # hold both workers inside the context at once
+        platforms.append(approval._get_session_platform())
+        return _outcome_for(tool_call, json.dumps({"ok": True}))
+
+    platform_token = _SESSION_PLATFORM.set("slack")
+    try:
+        claude_runtime._ensure_session(agent, "task-parallel")
+        tools = bridge.build_bridged_sdk_tools(agent, "task-parallel")
+        handler = _tools_by_name(tools)["web_search"].handler
+        with (
+            patch.object(
+                bridge, "execute_one_tool", side_effect=_fake_execute_one_tool
+            ),
+            patch.object(
+                bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result
+            ),
+        ):
+            responses = _run_handler_like_the_sdk_loop(
+                handler, {"query": "hermes"}, count=2
+            )
+    finally:
+        _SESSION_PLATFORM.reset(platform_token)
+
+    assert len(responses) == 2
+    assert all("is_error" not in r for r in responses)
+    assert platforms == ["slack", "slack"]
+
+
+# ---------------------------------------------------------------------------
 # Result conversion
 # ---------------------------------------------------------------------------
 
