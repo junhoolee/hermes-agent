@@ -5,6 +5,7 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
@@ -350,10 +351,115 @@ class TestFallbackChainDedup:
 # ── Claude subscription (claude_agent_sdk) fallback entries ───────────────
 
 
+class _FakeRateLimitError(Exception):
+    status_code = 429
+
+    def __init__(self):
+        super().__init__("Error code: 429 - rate limit exceeded")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"message": "rate limit exceeded"}}
+
+
 class TestClaudeAgentSdkFallback:
     """A `claude-code` chain entry must activate the Claude subscription
     runtime, and leaving it must release the live SDK session — mirrors
     what switch_model() already does for the /model command path."""
+
+    def test_midturn_429_hands_the_same_turn_to_the_sdk_runtime(self):
+        """State alone is not enough: the api_mode dispatch in
+        run_conversation() runs once, BEFORE the retry loop, so a mid-turn
+        fallback activation that lands on claude_agent_sdk must hand the
+        rest of THIS turn to the SDK runtime. Without the handoff the retry
+        path rebuilds an OpenAI client the swap deliberately removed
+        (client=None) and the turn dies on "Failed to recreate closed
+        OpenAI client" — Claude never serves a single turn."""
+        fbs = [{"provider": "claude-code", "model": "claude-sonnet-5"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._api_max_retries = 2
+
+        sdk_turns = []
+
+        def _sdk_turn(**kwargs):
+            sdk_turns.append(kwargs)
+            return {
+                "final_response": "served by the claude sdk runtime",
+                "messages": kwargs["messages"],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+        agent._run_claude_agent_sdk_turn = _sdk_turn
+
+        def _always_429(api_kwargs):
+            raise _FakeRateLimitError()
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_always_429),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch(
+                "hermes_cli.claude_code.subscription_enabled",
+                new=lambda config=None: True,
+            ),
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="claude-sdk://subscription", api_key=""),
+                    "claude-sonnet-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=200000,
+            ),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert len(sdk_turns) == 1, (
+            "the 429 turn itself must be served by the SDK runtime, "
+            f"got result: {result.get('final_response')!r}"
+        )
+        assert result["final_response"] == "served by the claude sdk runtime"
+        assert agent.api_mode == "claude_agent_sdk"
+
+    def test_unknown_declared_api_mode_falls_back_to_derivation(self):
+        """A typo'd entry api_mode must not be installed verbatim — it is
+        rejected with a warning and the wire is derived instead."""
+        fbs = [
+            {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "api_mode": "totally-bogus-mode",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "glm-4.7"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "chat_completions"
 
     def test_claude_code_entry_activates_the_sdk_runtime(self):
         """A `claude-code` chain entry must select the claude_agent_sdk

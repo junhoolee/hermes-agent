@@ -1827,10 +1827,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # claude-sdk://subscription endpoint) — then fall back to the same
         # canonical resolver switch_model() uses, so the two paths cannot
         # diverge again.
-        from hermes_cli.providers import determine_api_mode, normalize_provider
+        from hermes_cli.providers import (
+            TRANSPORT_TO_API_MODE,
+            determine_api_mode,
+            normalize_provider,
+        )
 
         fb_base_url = str(fb_client.base_url)
         fb_api_mode = (fb.get("api_mode") or "").strip().lower()
+        if fb_api_mode and fb_api_mode not in set(TRANSPORT_TO_API_MODE.values()):
+            # A typo'd or stale declared mode must not be installed verbatim
+            # — the conversation loop would dispatch a wire nothing serves.
+            logger.warning(
+                "Fallback entry %s/%s declares unknown api_mode %r; "
+                "deriving from provider/base URL instead",
+                fb_provider, fb_model, fb_api_mode,
+            )
+            fb_api_mode = ""
         if not fb_api_mode:
             fb_api_mode = determine_api_mode(fb_provider, fb_base_url, model=fb_model)
             if (
