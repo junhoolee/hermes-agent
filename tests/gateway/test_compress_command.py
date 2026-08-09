@@ -309,3 +309,71 @@ async def test_compress_command_passes_tool_messages_to_compressor():
     assert any(m.get("tool_calls") for m in passed), "assistant tool_calls stub dropped"
 
 
+
+
+@pytest.mark.asyncio
+async def test_compress_command_allows_keyless_claude_agent_sdk_runtime():
+    """The Claude subscription runtime carries api_key="" by contract
+    (hermes_cli/runtime_provider.py: the Agent SDK owns the login, Hermes
+    holds no credential).  /compress must not misreport that runtime as
+    "no provider configured" — the compression summariser resolves its own
+    one-shot SDK auxiliary client without a key."""
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    def _estimate(messages, **_kwargs):
+        return 100 if messages == history else 60
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_key": "",
+                "api_mode": "claude_agent_sdk",
+                "provider": "claude-code",
+                "base_url": "claude-sdk://subscription",
+            },
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="claude-sonnet-5"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "cannot compress" not in result, (
+        f"keyless claude_agent_sdk runtime rejected as no-provider: {result!r}"
+    )
+    agent_instance._compress_context.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_compress_command_still_rejects_truly_unconfigured_runtime():
+    """A runtime with no api_key AND no keyless api_mode is a genuine
+    misconfiguration — the no-provider refusal must stay."""
+    history = _make_history()
+    runner = _make_runner(history)
+
+    with (
+        patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "", "api_mode": "chat_completions", "provider": ""},
+        ),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "cannot compress" in result

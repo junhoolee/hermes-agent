@@ -3878,7 +3878,16 @@ class GatewaySlashCommandsMixin:
                 source=source,
                 session_key=session_key,
             )
-            if not runtime_kwargs.get("api_key"):
+            # The Claude subscription runtime carries api_key="" by contract
+            # (hermes_cli/runtime_provider.py: the Agent SDK owns the login,
+            # Hermes holds no credential), so an empty key alone is not proof
+            # of a missing provider. Only refuse when the runtime is neither
+            # keyed nor a keyless SDK mode.
+            from hermes_cli.claude_code import CLAUDE_CODE_API_MODE
+            if (
+                not runtime_kwargs.get("api_key")
+                and runtime_kwargs.get("api_mode") != CLAUDE_CODE_API_MODE
+            ):
                 return t("gateway.compress.no_provider")
 
             # Pass the FULL transcript (tool results included) — same
