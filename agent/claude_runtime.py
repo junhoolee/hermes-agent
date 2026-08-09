@@ -1473,6 +1473,17 @@ def _ensure_session(agent, effective_task_id: str) -> Any:
     one that happened to be active when the session was built.
     """
     from agent.transports.claude_agent_session import ClaudeAgentSession
+    from tools.thread_context import snapshot_thread_context
+
+    # The bridge's tool handlers run on the SDK-owned loop thread, where the
+    # gateway's ContextVars and the thread-local approval/sudo callbacks were
+    # never set — propagate_context_to_thread's "call on the parent thread"
+    # contract cannot be honoured there, and the approval gate would stop
+    # recognising this as a gateway session and auto-approve dangerous
+    # commands down the non-interactive branch.  Snapshot the turn thread's
+    # context on every turn (the gateway rebinds it per message) for the
+    # handlers to dispatch under.
+    agent._claude_bridge_context = snapshot_thread_context()
 
     holder = getattr(agent, "_claude_task_id_holder", None)
     if holder is None:
