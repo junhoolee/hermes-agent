@@ -1465,6 +1465,25 @@ def record_claude_compaction(agent, projector: ClaudeEventProjector) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _configured_start_timeout() -> Optional[float]:
+    """The user's `claude_subscription.start_timeout`, or None for the default.
+
+    Loaded here rather than threaded through the turn arguments because the
+    preflight already reads config the same way, and a config load failure
+    must degrade to the built-in default, never block a turn.
+    """
+    from hermes_cli.claude_subscription import claude_subscription_start_timeout
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        logger.debug("claude start_timeout config load failed", exc_info=True)
+        return None
+    return claude_subscription_start_timeout(config)
+
+
 def _ensure_session(agent, effective_task_id: str) -> Any:
     """Return this agent's ``ClaudeAgentSession``, building it on first turn.
 
@@ -1520,12 +1539,17 @@ def _ensure_session(agent, effective_task_id: str) -> Any:
 
     from agent.transports.claude_sanitized_transport import build_sanitized_transport
 
+    session_kwargs: Dict[str, Any] = {}
+    start_timeout = _configured_start_timeout()
+    if start_timeout is not None:
+        session_kwargs["start_timeout"] = start_timeout
     session = ClaudeAgentSession(
         options_factory=_options_factory,
         # The CLI is spawned from a sanitized environment, not from a copy of
         # os.environ — see the transport module for why options.env cannot do
         # this.
         transport_factory=build_sanitized_transport,
+        **session_kwargs,
     )
     agent._claude_session = session
     # Connect here, not lazily inside the first run_turn: a connect that
