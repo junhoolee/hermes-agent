@@ -44,6 +44,30 @@ def claude_subscription_enabled(config: Optional[dict] = None) -> bool:
     return bool(section.get("enabled", False))
 
 
+def claude_subscription_start_timeout(config: Optional[dict] = None) -> Optional[float]:
+    """The configured `claude_subscription.start_timeout` seconds, or None.
+
+    None means "use the runtime default" (``DEFAULT_START_TIMEOUT_SECONDS``
+    in :mod:`agent.transports.claude_agent_session`). Tolerates a missing,
+    empty, or malformed value the same way the gate does: anything that is
+    not a positive number reads as unset, so a hand-edited config.yaml can
+    never wedge session startup.
+    """
+    if not isinstance(config, dict):
+        return None
+    section: Any = config.get(_CONFIG_SECTION)
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("start_timeout")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 @functools.lru_cache(maxsize=1)
 def claude_agent_sdk_available() -> bool:
     """True when `claude_agent_sdk` is importable in this interpreter.
