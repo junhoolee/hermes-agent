@@ -881,6 +881,11 @@ class ClaudeEventProjector:
         self.session_id: Optional[str] = None
         self.terminal_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
+        # Usage of the LAST individual API call in the turn — each
+        # AssistantMessage carries its own call's usage, while ``usage``
+        # above (from ResultMessage) is the SDK's turn-cumulative sum.
+        # See record_claude_usage for why the distinction matters.
+        self.last_call_usage: Optional[Dict[str, Any]] = None
         self.total_cost_usd: Optional[float] = None
         self.result_text: Optional[str] = None
         self.compacted = False
@@ -967,6 +972,9 @@ class ClaudeEventProjector:
 
     def _on_assistant(self, message: Any) -> None:
         self._note_session_id(getattr(message, "session_id", None))
+        usage = getattr(message, "usage", None)
+        if isinstance(usage, dict) and usage:
+            self.last_call_usage = usage
         stop_reason = getattr(message, "stop_reason", None)
         if stop_reason:
             self.stop_reason = str(stop_reason)
@@ -1309,10 +1317,37 @@ def record_claude_usage(agent, projector: ClaudeEventProjector) -> Dict[str, Any
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
 
+    # ``ResultMessage.usage`` is turn-CUMULATIVE: the SDK sums every internal
+    # API call, and each call's input/cache tokens re-count the full live
+    # context.  A multi-tool turn therefore reports a "prompt" several times
+    # larger than what is actually in the window (observed 2026-08-09: a
+    # ~26K-token transcript reported 1,079,680 tokens and tripped gateway
+    # hygiene).  Live-context consumers — the compressor's threshold state,
+    # gateway hygiene via session_entry.last_prompt_tokens, the context
+    # footer — get the LAST call's context size instead; billing and session
+    # accounting below stay on the cumulative figures.
+    last_call = projector.last_call_usage
+    last_context_tokens = canonical_usage.prompt_tokens
+    if isinstance(last_call, dict) and last_call:
+        _last_call_context = (
+            _coerce_usage_int(last_call.get("input_tokens"))
+            + _coerce_usage_int(last_call.get("cache_read_input_tokens"))
+            + _coerce_usage_int(last_call.get("cache_creation_input_tokens"))
+        )
+        if _last_call_context > 0:
+            last_context_tokens = _last_call_context
+
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            compressor.update_from_response(
+                {
+                    **usage_dict,
+                    "prompt_tokens": last_context_tokens,
+                    "total_tokens": last_context_tokens
+                    + canonical_usage.output_tokens,
+                }
+            )
         except Exception:
             logger.debug("claude_agent_sdk usage update failed", exc_info=True)
 
@@ -1370,7 +1405,7 @@ def record_claude_usage(agent, projector: ClaudeEventProjector) -> Dict[str, Any
 
     return {
         **usage_dict,
-        "last_prompt_tokens": canonical_usage.prompt_tokens,
+        "last_prompt_tokens": last_context_tokens,
         "estimated_cost_usd": float(cost_result.amount_usd)
         if cost_result.amount_usd is not None
         else None,

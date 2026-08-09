@@ -153,6 +153,9 @@ class AssistantMessage:
     stop_reason: str | None = None
     session_id: str | None = None
     error: str | None = None
+    # Per-call API usage, mirroring the real SDK class (types.py) — each
+    # AssistantMessage carries the usage of the single API call it came from.
+    usage: dict | None = None
 
 
 @dataclass
@@ -952,3 +955,88 @@ def test_start_timeout_ignores_a_malformed_config_value(monkeypatch):
         {"claude_subscription": {"enabled": True, "start_timeout": "soon"}},
     )
     assert "start_timeout" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# last_prompt_tokens approximates the LIVE context, not the turn total
+# ---------------------------------------------------------------------------
+
+
+def test_last_prompt_tokens_is_the_last_calls_context_not_the_turn_sum():
+    """``ResultMessage.usage`` is turn-CUMULATIVE: every internal API call's
+    input/cache tokens are summed, so a multi-tool turn reports a "prompt"
+    several times larger than the live context (observed 2026-08-09: a
+    ~26K-token transcript reported 1,079,680 "actual" tokens and tripped
+    gateway hygiene).  Live-context consumers (hygiene, compression
+    thresholds, the context footer) must get the LAST call's context size —
+    input + cache_read + cache_write of the final API call — while billing
+    keeps the cumulative figures."""
+    agent = _make_agent("web_search")
+    prompt_before = agent.session_prompt_tokens
+    session = _StubSession(
+        [
+            AssistantMessage(
+                content=[ToolUseBlock("t1", "mcp__hermes__web_search", {"query": "a"})],
+                usage={
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 100_000,
+                    "cache_creation_input_tokens": 5_000,
+                    "output_tokens": 50,
+                },
+            ),
+            UserMessage(content=[ToolResultBlock("t1", "results")]),
+            AssistantMessage(
+                content=[TextBlock("done")],
+                usage={
+                    "input_tokens": 20,
+                    "cache_read_input_tokens": 140_000,
+                    "cache_creation_input_tokens": 1_000,
+                    "output_tokens": 30,
+                },
+            ),
+            ResultMessage(
+                result="done",
+                # The SDK's turn-cumulative sum of both calls above.
+                usage={
+                    "input_tokens": 30,
+                    "output_tokens": 80,
+                    "cache_read_input_tokens": 240_000,
+                    "cache_creation_input_tokens": 6_000,
+                },
+            ),
+        ]
+    )
+    result, _messages = _run_turn(agent, session)
+
+    last_call_context = 20 + 140_000 + 1_000
+    turn_cumulative = 30 + 240_000 + 6_000
+
+    assert result["last_prompt_tokens"] == last_call_context, (
+        f"last_prompt_tokens={result['last_prompt_tokens']} — expected the "
+        f"last call's context ({last_call_context}), not the turn sum "
+        f"({turn_cumulative})"
+    )
+    # The compressor drives hygiene/threshold decisions — same correction.
+    assert agent.context_compressor.last_prompt_tokens == last_call_context
+    # Billing/session accounting stays turn-cumulative — untouched.
+    assert agent.session_prompt_tokens == prompt_before + turn_cumulative
+    assert result["prompt_tokens"] == turn_cumulative
+
+
+def test_last_prompt_tokens_falls_back_to_cumulative_without_per_call_usage():
+    """Older CLIs may not stamp per-call usage on assistant messages; the
+    cumulative figure is then the only (over-)estimate available."""
+    agent = _make_agent("web_search")
+    session = _StubSession(
+        [
+            AssistantMessage(content=[TextBlock("hello")]),
+            ResultMessage(
+                result="hello",
+                usage={"input_tokens": 12, "output_tokens": 3},
+            ),
+        ]
+    )
+    result, _messages = _run_turn(agent, session)
+
+    assert result["last_prompt_tokens"] == 12
+    assert agent.context_compressor.last_prompt_tokens == 12
