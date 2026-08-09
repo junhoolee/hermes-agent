@@ -1821,51 +1821,50 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
-        fb_base_url = str(fb_client.base_url)
-        _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
-            fb_api_mode = "codex_responses"
-        elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
-            # Portal is dual-wire: anthropic/* must land on /v1/messages.
-            # resolve_provider_client still returns an OpenAI client for
-            # Nous; the anthropic_messages branch below rebuilds the native
-            # client from that credential + base_url.
-            from hermes_cli.providers import nous_api_mode
+        # Determine api_mode: honor the entry's declared key first —
+        # ``hermes fallback add`` writes it for providers whose wire cannot
+        # be derived from the base URL (claude-code resolves to the opaque
+        # claude-sdk://subscription endpoint) — then fall back to the same
+        # canonical resolver switch_model() uses, so the two paths cannot
+        # diverge again.
+        from hermes_cli.providers import determine_api_mode, normalize_provider
 
-            fb_api_mode = nous_api_mode(fb_model)
-        elif (
-            fb_provider == "anthropic"
-            or fb_base_url.rstrip("/").lower().endswith("/anthropic")
-            or base_url_hostname(fb_base_url) == "api.anthropic.com"
+        fb_base_url = str(fb_client.base_url)
+        fb_api_mode = (fb.get("api_mode") or "").strip().lower()
+        if not fb_api_mode:
+            fb_api_mode = determine_api_mode(fb_provider, fb_base_url, model=fb_model)
+            if (
+                fb_api_mode == "chat_completions"
+                and not agent._is_azure_openai_url(fb_base_url)
+                and agent._provider_model_requires_responses_api(
+                    fb_model,
+                    provider=fb_provider,
+                )
+            ):
+                # GPT-5.x models usually need Responses API, but keep
+                # provider-specific exceptions like Azure OpenAI and
+                # Copilot gpt-5-mini on chat completions.
+                # determine_api_mode() resolves provider/host, not
+                # model-mandated wires, so this carve-out stays.
+                fb_api_mode = "codex_responses"
+
+        # Leaving the Claude subscription runtime: the live SDK session owns
+        # an OS thread and a Claude Code subprocess pinned to the old
+        # provider. Release it before the swap so a chain advance past
+        # claude-code cannot leak either — mirrors switch_model().
+        if (
+            getattr(agent, "api_mode", "") == "claude_agent_sdk"
+            and fb_api_mode != "claude_agent_sdk"
         ):
-            # Custom providers (e.g. cron-anthropic) point at the native
-            # api.anthropic.com host with no "/anthropic" path suffix, so the
-            # name/suffix checks above miss them and they default to
-            # chat_completions → POST /v1/chat/completions → 404. Match the
-            # host the same way determine_api_mode() and _detect_api_mode_for_url()
-            # do on the primary path. (#32243, #49247)
-            fb_api_mode = "anthropic_messages"
-        elif _fb_is_azure:
-            # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
-            # support the Responses API. Stay on chat_completions.
-            fb_api_mode = "chat_completions"
-        elif agent._is_direct_openai_url(fb_base_url):
-            fb_api_mode = "codex_responses"
-        elif agent._provider_model_requires_responses_api(
-            fb_model,
-            provider=fb_provider,
-        ):
-            # GPT-5.x models usually need Responses API, but keep
-            # provider-specific exceptions like Copilot gpt-5-mini on
-            # chat completions.
-            fb_api_mode = "codex_responses"
-        elif fb_provider == "bedrock" or (
-            base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-            and base_url_host_matches(fb_base_url, "amazonaws.com")
-        ):
-            fb_api_mode = "bedrock_converse"
+            _release = getattr(agent, "_release_claude_agent_sdk_session", None)
+            if callable(_release):
+                try:
+                    _release()
+                except Exception:  # noqa: BLE001 - teardown must not block the swap
+                    logger.debug(
+                        "Fallback: Claude Agent SDK session release failed",
+                        exc_info=True,
+                    )
 
         old_model = agent.model
         old_provider = agent.provider
@@ -1926,17 +1925,33 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # SDK default.
         _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
-        if fb_api_mode == "anthropic_messages":
-            # Build native Anthropic client instead of using OpenAI client
+        if fb_api_mode == "claude_agent_sdk":
+            # The Claude subscription runtime owns its own endpoint and its
+            # own credential, so there is no HTTP client to install — the
+            # generic branch below would hand the auxiliary one-shot adapter
+            # (base_url claude-sdk://subscription) to the main loop, which
+            # hard-fails every fallback turn. Leave client=None so the
+            # conversation loop dispatches _run_claude_agent_sdk_turn().
+            # Mirrors switch_model().
+            agent.api_key = ""
+            agent.client = None
+            agent._client_kwargs = {}
+        elif fb_api_mode == "anthropic_messages":
+            # Build native Anthropic client instead of using OpenAI client.
+            # Compare the *normalized* slug: aliases ("claude", and
+            # "claude-code" while the subscription gate is shut) resolve to
+            # anthropic and must get the same token fallback + OAuth
+            # detection as the literal provider id.
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-            effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
+            _fb_is_native_anthropic = normalize_provider(fb_provider) == "anthropic"
+            effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if _fb_is_native_anthropic else (fb_client.api_key or "")
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = fb_base_url
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
             )
-            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
+            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if _fb_is_native_anthropic else False
             agent.client = None
             agent._client_kwargs = {}
         else:
