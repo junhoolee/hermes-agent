@@ -1270,6 +1270,27 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    def _handoff_turn_to_claude_agent_sdk():
+        """Serve the REST of this turn from the Claude Agent SDK runtime.
+
+        The api_mode dispatch above runs exactly once, before the retry
+        loop. When a mid-turn fallback activation lands on
+        ``claude_agent_sdk`` (``_try_activate_fallback`` returned True and
+        set ``agent.client = None`` — the SDK owns its own transport), the
+        retry paths below cannot continue: they rebuild an OpenAI client
+        the swap deliberately removed and the turn hard-fails. Every
+        fallback call site must return this instead of ``continue``-ing.
+        The user message is already in ``messages``, which is exactly the
+        state ``run_claude_agent_sdk_turn`` documents as its contract.
+        """
+        return agent._run_claude_agent_sdk_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -2040,6 +2061,8 @@ def run_conversation(
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
                         if agent._try_activate_fallback():
+                            if agent.api_mode == "claude_agent_sdk":
+                                return _handoff_turn_to_claude_agent_sdk()
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2473,6 +2496,8 @@ def run_conversation(
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
+                        if agent.api_mode == "claude_agent_sdk":
+                            return _handoff_turn_to_claude_agent_sdk()
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2546,6 +2571,8 @@ def run_conversation(
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                         if agent._try_activate_fallback():
+                            if agent.api_mode == "claude_agent_sdk":
+                                return _handoff_turn_to_claude_agent_sdk()
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -2723,6 +2750,8 @@ def run_conversation(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
                     if agent._try_activate_fallback():
+                        if agent.api_mode == "claude_agent_sdk":
+                            return _handoff_turn_to_claude_agent_sdk()
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2892,6 +2921,8 @@ def run_conversation(
                                 "Content filter terminated stream; switching to fallback..."
                             )
                             if agent._try_activate_fallback():
+                                if agent.api_mode == "claude_agent_sdk":
+                                    return _handoff_turn_to_claude_agent_sdk()
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -4330,6 +4361,8 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
+                            if agent.api_mode == "claude_agent_sdk":
+                                return _handoff_turn_to_claude_agent_sdk()
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -4363,6 +4396,8 @@ def run_conversation(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
+                        if agent.api_mode == "claude_agent_sdk":
+                            return _handoff_turn_to_claude_agent_sdk()
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4894,6 +4929,8 @@ def run_conversation(
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
+                        if agent.api_mode == "claude_agent_sdk":
+                            return _handoff_turn_to_claude_agent_sdk()
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5117,6 +5154,8 @@ def run_conversation(
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
+                        if agent.api_mode == "claude_agent_sdk":
+                            return _handoff_turn_to_claude_agent_sdk()
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6541,6 +6580,8 @@ def run_conversation(
                             "switching to fallback provider..."
                         )
                         if agent._try_activate_fallback():
+                            if agent.api_mode == "claude_agent_sdk":
+                                return _handoff_turn_to_claude_agent_sdk()
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
