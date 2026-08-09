@@ -2428,6 +2428,21 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     }
 
 
+def _runtime_is_keyless(runtime_kwargs: Optional[dict]) -> bool:
+    """True when the resolved runtime legitimately carries no API key.
+
+    The Claude subscription runtime (``api_mode="claude_agent_sdk"``) holds
+    no credential by contract — the Agent SDK resolves the user's own login
+    (see hermes_cli/runtime_provider.py).  An empty ``api_key`` alone
+    therefore does not mean "no provider configured", and every gateway
+    surface that refuses work on a missing key must consult this predicate
+    first (manual /compress, session hygiene, background tasks).
+    """
+    from hermes_cli.claude_code import CLAUDE_CODE_API_MODE
+
+    return (runtime_kwargs or {}).get("api_mode") == CLAUDE_CODE_API_MODE
+
+
 def _credential_pool_for_provider(provider: Optional[str]):
     """Return the live credential pool for a provider id (e.g. ``custom:hyper``)."""
     if not provider or not str(provider).strip():
@@ -16074,7 +16089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
-                        if _hyg_runtime.get("api_key"):
+                        if _hyg_runtime.get("api_key") or _runtime_is_keyless(_hyg_runtime):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -16447,6 +16462,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
                                         )
+                        else:
+                            # Never skip silently: an over-threshold session
+                            # that hygiene cannot compress must leave a trace,
+                            # or it just keeps growing with no compress /
+                            # failure / rotation log at all (2026-08-09
+                            # incident: the keyless Claude subscription
+                            # runtime tripped this gate every turn without a
+                            # single line of evidence).
+                            logger.warning(
+                                "Session hygiene: skipping compression for %s "
+                                "— resolved runtime (provider=%s api_mode=%s) "
+                                "has no API key and is not a recognized "
+                                "keyless runtime",
+                                session_entry.session_id,
+                                _hyg_runtime.get("provider") or "",
+                                _hyg_runtime.get("api_mode") or "",
+                            )
 
                     except Exception as e:
                         logger.warning(
@@ -18520,7 +18552,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 user_config=user_config,
             )
-            if not runtime_kwargs.get("api_key"):
+            if not runtime_kwargs.get("api_key") and not _runtime_is_keyless(
+                runtime_kwargs
+            ):
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
