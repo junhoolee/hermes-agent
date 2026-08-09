@@ -61,13 +61,20 @@ def _callback_api():
     )
 
 
-def propagate_context_to_thread(target: Callable) -> Callable:
-    """Wrap *target* for execution on a worker thread with the *current*
-    thread's ContextVars and approval/sudo callbacks propagated.
+def snapshot_thread_context() -> Callable[[Callable], Callable]:
+    """Capture the current thread's ContextVars and approval/sudo callbacks
+    now, for tool dispatch that will be initiated from some OTHER thread.
 
-    Call this on the parent thread; pass the returned callable as the
-    thread/executor target.  The returned callable forwards its positional
-    and keyword arguments to *target* and returns its result.
+    :func:`propagate_context_to_thread` must run on the parent thread at
+    hand-off time; a dispatcher that does not live on the parent thread (the
+    ``claude_tool_bridge`` handlers run on the SDK-owned event-loop thread)
+    has nothing valid to capture there.  Such a dispatcher takes the snapshot
+    on the parent thread while it still has it, stores the returned factory,
+    and wraps each worker target with it at dispatch time.
+
+    Each wrapped call runs under its own copy of the captured context, so one
+    snapshot may serve concurrent workers — a shared ``contextvars.Context``
+    raises "cannot enter context" when entered twice at once.
 
     Fail-closed: if callback installation raises, the callbacks are left
     unset (``None``).  That is the safe outcome — ``prompt_dangerous_approval``
@@ -86,35 +93,55 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     except Exception:
         logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
 
-    def _runner(*args, **kwargs):
-        def _inner():
-            if setters is not None:
-                set_approval, set_sudo = setters
-                try:
-                    if parent_approval_cb is not None:
-                        set_approval(parent_approval_cb)
-                    if parent_sudo_cb is not None:
-                        set_sudo(parent_sudo_cb)
-                except Exception:
-                    logger.debug(
-                        "Failed to install propagated approval/sudo callbacks; "
-                        "dangerous-command approval will fail closed",
-                        exc_info=True,
-                    )
-            try:
-                return target(*args, **kwargs)
-            finally:
+    def _wrap(target: Callable) -> Callable:
+        def _runner(*args, **kwargs):
+            def _inner():
                 if setters is not None:
                     set_approval, set_sudo = setters
                     try:
-                        set_approval(None)
-                        set_sudo(None)
+                        if parent_approval_cb is not None:
+                            set_approval(parent_approval_cb)
+                        if parent_sudo_cb is not None:
+                            set_sudo(parent_sudo_cb)
                     except Exception:
                         logger.debug(
-                            "Failed to clear propagated approval/sudo callbacks",
+                            "Failed to install propagated approval/sudo callbacks; "
+                            "dangerous-command approval will fail closed",
                             exc_info=True,
                         )
+                try:
+                    return target(*args, **kwargs)
+                finally:
+                    if setters is not None:
+                        set_approval, set_sudo = setters
+                        try:
+                            set_approval(None)
+                            set_sudo(None)
+                        except Exception:
+                            logger.debug(
+                                "Failed to clear propagated approval/sudo callbacks",
+                                exc_info=True,
+                            )
 
-        return ctx.run(_inner)
+            return ctx.copy().run(_inner)
 
-    return _runner
+        return _runner
+
+    return _wrap
+
+
+def propagate_context_to_thread(target: Callable) -> Callable:
+    """Wrap *target* for execution on a worker thread with the *current*
+    thread's ContextVars and approval/sudo callbacks propagated.
+
+    Call this on the parent thread; pass the returned callable as the
+    thread/executor target.  The returned callable forwards its positional
+    and keyword arguments to *target* and returns its result.
+
+    Fail-closed: if callback installation raises, the callbacks are left
+    unset (``None``).  That is the safe outcome — ``prompt_dangerous_approval``
+    denies dangerous commands when no callback is registered in an interactive
+    context, and the gateway approval queue blocks when its notify callback is
+    absent.
+    """
+    return snapshot_thread_context()(target)
