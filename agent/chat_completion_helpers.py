@@ -2570,6 +2570,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # endpoints (e.g. Ollama Cloud) resolve correctly instead of
         # falling through to OpenRouter defaults.
         from hermes_cli.fallback_config import resolve_entry_api_key
+        from hermes_cli.providers import (
+            TRANSPORT_TO_API_MODE,
+            determine_api_mode,
+            normalize_provider,
+        )
 
         fb_base_url_hint = (fb.get("base_url") or "").strip() or None
         fb_api_key_hint = resolve_entry_api_key(fb)
@@ -2581,10 +2586,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         #
         # An explicit ``api_mode`` on the fallback entry always wins — including
         # an explicit "chat_completions" — and suppresses all re-detection below.
-        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
+        # It must be a mode the conversation loop can actually dispatch,
+        # though: a typo'd or stale declared value is dropped with a warning
+        # and the wire is derived instead, rather than being installed
+        # verbatim as agent.api_mode.
+        fb_api_mode_declared = str(fb.get("api_mode") or "").strip().lower()
+        if fb_api_mode_declared and fb_api_mode_declared not in set(TRANSPORT_TO_API_MODE.values()):
+            logger.warning(
+                "Fallback entry %s/%s declares unknown api_mode %r; "
+                "deriving from provider/base URL instead",
+                fb_provider, fb_model, fb_api_mode_declared,
+            )
+            fb_api_mode_declared = ""
+        fb_api_mode_explicit = bool(fb_api_mode_declared)
         fb_api_mode = "chat_completions"
         if fb_api_mode_explicit:
-            fb_api_mode = str(fb.get("api_mode")).strip()
+            fb_api_mode = fb_api_mode_declared
         elif fb_provider == "anthropic":
             # Provider-name check must not be gated on fb_base_url_hint:
             # an entry that names provider: anthropic without an explicit
@@ -2631,8 +2648,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # the pre-computed pass above landed on the default and the user did
         # not pin api_mode explicitly. An explicit fb.api_mode (even
         # "chat_completions") must never be overridden here.
-        from hermes_cli.providers import determine_api_mode, normalize_provider
-
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
