@@ -1814,3 +1814,94 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
         await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Keyless Claude subscription runtime (api_key="" by contract)
+# ---------------------------------------------------------------------------
+
+class _RecordingCompressAgent:
+    """Hygiene agent stub that records whether compression was attempted."""
+
+    last_instance = None
+
+    def __init__(self, **kwargs):
+        self.model = kwargs.get("model")
+        self.session_id = kwargs.get("session_id", "fake-session")
+        self.compression_in_place = False
+        self._print_fn = None
+        self.compress_called = False
+        self.shutdown_memory_provider = MagicMock()
+        self.close = MagicMock()
+        type(self).last_instance = self
+
+    def _compress_context(self, messages, *_args, **_kwargs):
+        self.compress_called = True
+        # No rotation, no in-place — the preserve-transcript guard applies,
+        # which is fine: this test only cares that the block was ENTERED.
+        return (list(messages), None)
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_runs_for_keyless_claude_agent_sdk_runtime(
+    monkeypatch, tmp_path
+):
+    """The Claude subscription runtime carries api_key="" by contract
+    (hermes_cli/runtime_provider.py: the Agent SDK owns the login).  The
+    hygiene gate must not mistake it for "no provider" and silently skip
+    compression — that silent skip is exactly how an over-threshold session
+    kept growing with no compress/failure/rotation log at all."""
+    _RecordingCompressAgent.last_instance = None
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, _RecordingCompressAgent, "compression:\n  enabled: true\n"
+    )
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "api_key": "",
+            "api_mode": "claude_agent_sdk",
+            "provider": "claude-code",
+            "base_url": "claude-sdk://subscription",
+        },
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert _RecordingCompressAgent.last_instance is not None, (
+        "hygiene silently skipped the keyless claude_agent_sdk runtime "
+        "(api_key gate) — compression agent was never built"
+    )
+    assert _RecordingCompressAgent.last_instance.compress_called is True
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_logs_instead_of_silently_skipping_unkeyed_runtime(
+    monkeypatch, tmp_path, caplog
+):
+    """A genuinely credential-less runtime must still skip compression — but
+    LOUDLY.  The 2026-08-09 incident's worst property was that the gate left
+    no trace: "auto-compressing" was logged, then nothing."""
+    import logging
+
+    _RecordingCompressAgent.last_instance = None
+    runner, adapter, event = _make_progress_runner(
+        monkeypatch, tmp_path, _RecordingCompressAgent, "compression:\n  enabled: true\n"
+    )
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "", "api_mode": "chat_completions", "provider": ""},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert _RecordingCompressAgent.last_instance is None
+    assert any(
+        "no api key" in rec.getMessage().lower() for rec in caplog.records
+    ), f"expected a loud skip log, got: {[r.getMessage() for r in caplog.records]}"
