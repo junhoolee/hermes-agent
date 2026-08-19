@@ -3635,6 +3635,42 @@ class SlackAdapter(BasePlatformAdapter):
         # 5) Protect blockquote markers before escaping
         text = re.sub(r"^(>+\s)", lambda m: _ph(m.group(0)), text, flags=re.MULTILINE)
 
+        # 5b) Wrap remaining bare URLs (not already part of a markdown link
+        # or an existing <url> entity — both already protected above) in
+        # explicit <url> Slack link syntax before any emphasis conversion.
+        # Without this, a bare URL sitting directly against a markdown
+        # delimiter (e.g. "**https://example.com/path**", no space before
+        # the closing **) leaves the literal characters "https://.../path**"
+        # in the outgoing text. Slack's own bare-URL autolinker then treats
+        # the trailing "*" as part of the URL (it's a valid path/query
+        # character), producing a broken link that 404s or redirects
+        # somewhere unintended, while the "*" pair no longer closes as bold.
+        # Wrapping here — and protecting the result as a placeholder — makes
+        # the URL boundary explicit so later bold/italic passes can't extend
+        # into it, and reuses the existing zero-width-space handling in
+        # _convert_bold (step 9) for the placeholder-adjacent "*" case.
+        def _strip_url_trailing_punct(url: str) -> Tuple[str, str]:
+            trailing = ""
+            while url:
+                ch = url[-1]
+                if ch in ")]}":
+                    opener = {"}": "{", "]": "[", ")": "("}[ch]
+                    if url.count(opener) >= url.count(ch):
+                        break  # balanced (or more opens) — likely part of the URL itself
+                elif ch not in "*_~'\".,;:!?":
+                    break
+                trailing = ch + trailing
+                url = url[:-1]
+            return url, trailing
+
+        def _wrap_bare_url(m):
+            url, trailing = _strip_url_trailing_punct(m.group(0))
+            if not url:
+                return m.group(0)
+            return _ph(f"<{url}>") + trailing
+
+        text = re.sub(r"https?://[^\s<>\x00]+", _wrap_bare_url, text)
+
         # 6) Escape Slack control characters in remaining plain text.
         # Unescape first so already-escaped input doesn't get double-escaped.
         # Single pass: sequential str.replace would re-scan its own output, so
