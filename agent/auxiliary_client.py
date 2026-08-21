@@ -5190,6 +5190,20 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
     try:
+        from agent.claude_auxiliary import (
+            AsyncClaudeAuxiliaryClient,
+            ClaudeAuxiliaryClient,
+        )
+
+        if isinstance(sync_client, ClaudeAuxiliaryClient):
+            # The Claude subscription shim is not an HTTP client: its
+            # base_url is the internal ``claude-sdk://subscription`` scheme.
+            # Wrapping it in AsyncOpenAI below would send that scheme into
+            # httpx, which fails with UnsupportedProtocol on every call.
+            return AsyncClaudeAuxiliaryClient(sync_client), model
+    except ImportError:  # pragma: no cover - module ships with core
+        pass
+    try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):

@@ -510,6 +510,23 @@ class TestAuxiliaryRouting:
         )
         assert isinstance(client, claude_auxiliary.AsyncClaudeAuxiliaryClient)
 
+    def test_sync_shim_converts_to_async_facade_not_http(self):
+        """_to_async_client must never wrap the shim in a real AsyncOpenAI.
+
+        The async vision path resolves the sync shim first and converts it;
+        without a dedicated branch the generic converter builds an HTTP client
+        against ``claude-sdk://subscription`` and every call dies in httpx
+        with UnsupportedProtocol.
+        """
+        from agent import auxiliary_client
+
+        sync_client = claude_auxiliary.ClaudeAuxiliaryClient("claude-sonnet-5")
+        async_client, model = auxiliary_client._to_async_client(
+            sync_client, "claude-sonnet-5", is_vision=True
+        )
+        assert isinstance(async_client, claude_auxiliary.AsyncClaudeAuxiliaryClient)
+        assert model == "claude-sonnet-5"
+
     def test_missing_extra_degrades_instead_of_raising(
         self, sdk_absent, subscription_gate_open
     ):
