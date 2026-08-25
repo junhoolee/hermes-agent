@@ -317,6 +317,22 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def _mcp_subprocess_env() -> dict[str, str]:
+    """Env shared by every Hermes-spawned stdio MCP subprocess: the
+    allowlisted ambient vars plus the repo root on PYTHONPATH so `-m`
+    resolves (McpStdioServerConfig has no cwd field). Shared by
+    `_build_hermes_tools_mcp_config` and the OAuth stdio proxy branch of
+    `_build_external_mcp_configs` so the two subprocess launchers cannot
+    drift apart."""
+    env = {
+        key: os.environ[key]
+        for key in _MCP_ENV_ALLOWLIST
+        if os.environ.get(key)
+    }
+    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + os.environ.get("PYTHONPATH", "")
+    return env
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -324,12 +340,7 @@ def _build_hermes_tools_mcp_config(
     the exact server the codex runtime uses (backend-agnostic), launched with
     this venv's interpreter. McpStdioServerConfig has no cwd field, so the
     repo root rides PYTHONPATH."""
-    env = {
-        key: os.environ[key]
-        for key in _MCP_ENV_ALLOWLIST
-        if os.environ.get(key)
-    }
-    env["PYTHONPATH"] = _hermes_repo_root() + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env = _mcp_subprocess_env()
     if hermes_session_id:
         # Lets the stateless session_search shim exclude the calling
         # session's own lineage from recall results (#26567). The shim reads
@@ -344,6 +355,97 @@ def _build_hermes_tools_mcp_config(
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
         "env": env,
     }
+
+
+def _load_mcp_config() -> dict[str, Any]:
+    """config.yaml `mcp_servers:` entries, security-filtered and
+    env-interpolated (tools.mcp_tool._load_mcp_config). Module-level name so
+    tests can stub it; lazy import because tools.mcp_tool is heavy."""
+    from tools.mcp_tool import _load_mcp_config as _real_load
+
+    return _real_load()
+
+
+_RESERVED_MCP_KEYS = frozenset({"hermes-tools"})
+
+
+def _has_oauth_tokens(server_name: str) -> bool:
+    """Whether Hermes's own OAuth token store (~/.hermes/mcp-tokens/, see
+    tools.mcp_oauth.HermesTokenStorage) already has cached tokens for
+    `server_name`. Module-level name so tests can stub it; lazy import
+    because tools.mcp_oauth is heavy. Any failure (unreadable dir, corrupt
+    profile, ...) degrades to False — this is a probe, never a hard
+    dependency."""
+    try:
+        from tools.mcp_oauth import HermesTokenStorage
+
+        return HermesTokenStorage(server_name).has_cached_tokens()
+    except Exception:
+        return False
+
+
+def _build_external_mcp_configs() -> dict[str, dict[str, Any]]:
+    """Convert enabled config.yaml mcp_servers entries into SDK-typed configs.
+
+    A remote `auth: oauth` server (e.g. Notion) with cached Hermes tokens
+    (`_has_oauth_tokens`) routes through the Hermes-side stdio OAuth proxy
+    (agent.transports.oauth_mcp_proxy) instead of a raw http config, because
+    the SDK-spawned CLI can never read Hermes's own OAuth token store
+    itself. Without cached tokens (or on token-probe failure) it keeps the
+    bare-http fallback: a doomed proxy is never spawned, and the raw entry
+    stays visible/diagnosable instead of silently vanishing. Scoped to
+    streamable HTTP only — an `auth: oauth` + `transport: sse` entry keeps
+    the raw sse emission until the proxy grows an SSE client path.
+    """
+    try:
+        from hermes_cli.tools_config import _parse_enabled_flag
+
+        out: dict[str, dict[str, Any]] = {}
+        for name, cfg in (_load_mcp_config() or {}).items():
+            if name in _RESERVED_MCP_KEYS or not isinstance(cfg, dict):
+                continue
+            if not _parse_enabled_flag(cfg.get("enabled", True), default=True):
+                continue
+            url = cfg.get("url")
+            is_oauth = (cfg.get("auth") or "").lower().strip() == "oauth"
+            if url and cfg.get("transport") == "sse":
+                entry: dict[str, Any] = {"type": "sse", "url": url}
+            elif url and is_oauth:
+                try:
+                    has_tokens = _has_oauth_tokens(name)
+                except Exception:
+                    has_tokens = False
+                if has_tokens:
+                    out[name] = {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [
+                            "-m", "agent.transports.oauth_mcp_proxy",
+                            "--server", name,
+                        ],
+                        "env": _mcp_subprocess_env(),
+                    }
+                    continue
+                entry = {"type": "http", "url": url}
+            elif url:
+                entry = {"type": "http", "url": url}
+            elif cfg.get("command"):
+                entry = {
+                    "type": "stdio",
+                    "command": cfg["command"],
+                    "args": list(cfg.get("args") or []),
+                    "env": dict(cfg.get("env") or {}),
+                }
+            else:
+                continue  # malformed: nothing to launch
+            headers = cfg.get("headers")
+            if headers and entry["type"] in ("http", "sse"):
+                entry["headers"] = dict(headers)
+            out[name] = entry
+        return out
+    except Exception:
+        logger.debug("external MCP config merge failed", exc_info=True)
+        return {}
 
 
 class _StreamEnd:
@@ -377,7 +479,7 @@ class ClaudeAgentSdkSession:
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
-        on_unsolicited_result: Optional[Callable[[str], None]] = None,
+        on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -548,6 +650,22 @@ class ClaudeAgentSdkSession:
             result.fatal_reason = "auth" if hint else "startup"
             return result
 
+        # Text buffered before this turn whose terminal ResultMessage never
+        # arrived is partial mid-burst content — a later unrelated result
+        # must never pick it up (misattribution is the proven worse failure;
+        # texts parked DURING the turn re-buffer via the residue drain and
+        # are unaffected). Never a silent drop: WARN what is discarded.
+        stale = list(self._unsolicited_text)
+        if stale:
+            self._unsolicited_text.clear()
+            logger.warning(
+                "claude-agent-sdk: discarding %d stale unsolicited text(s) "
+                "(%d chars) buffered before this turn — their terminal "
+                "ResultMessage never arrived; attaching them to a later "
+                "unrelated result is the proven worse failure",
+                len(stale), sum(len(t) for t in stale),
+            )
+
         # An interrupt that arrived between turns or during connect (up to
         # 60s) targets THIS turn — honor it instead of erasing it. (The old
         # unconditional clear() silently swallowed that window.)
@@ -695,9 +813,36 @@ class ClaudeAgentSdkSession:
             # Anything the reader parked after our ResultMessage belongs to a
             # CLI-initiated turn that overlapped ours. Route it now — left in
             # a discarded queue it would be lost, and left in the stream it
-            # would become the next turn's answer.
+            # would become the next turn's answer. EXCEPT a residue result
+            # that repeats THIS turn's own answer: delivering it through the
+            # background lane re-presents the agent's own text as a fake
+            # completion (the 2026-08-06 echo class) — suppress it, dedup-mark
+            # it, and consume its burst buffer. Genuinely different residue is
+            # a real background completion and still delivers.
+            final_norm = " ".join(str(out["final_text"]).split())
             while not inbox.empty():
-                self._handle_unsolicited(inbox.get_nowait())
+                residue = inbox.get_nowait()
+                if final_norm and type(residue).__name__ == "ResultMessage":
+                    res_text = getattr(residue, "result", None)
+                    if (
+                        isinstance(res_text, str)
+                        and " ".join(res_text.split()) == final_norm
+                    ):
+                        uuid = getattr(residue, "uuid", None)
+                        if uuid:
+                            self._unsolicited_delivered.add(uuid)
+                        self._unsolicited_results += 1
+                        buffered = len(self._unsolicited_text)
+                        self._unsolicited_text.clear()
+                        logger.warning(
+                            "claude-agent-sdk: residue ResultMessage %s "
+                            "matches this turn's own answer — suppressed, "
+                            "never delivered as a background result "
+                            "(%d buffered text(s) consumed)",
+                            uuid, buffered,
+                        )
+                        continue
+                self._handle_unsolicited(residue)
         return out
 
     # ---------- stream ownership ----------
@@ -753,10 +898,10 @@ class ClaudeAgentSdkSession:
         These are real CLI output (typically a finished background Agent task
         reporting in). They answer nothing Hermes asked, so they must never
         enter a turn's result — but their CONTENT is completed work the user
-        is waiting on: with a delivery callback wired, capture the top-level
-        assistant text and hand the assembled answer over on the terminal
-        ResultMessage (uuid-deduped). Without a callback, the historical
-        WARN-drop stands."""
+        is waiting on: with a delivery callback wired, capture each top-level
+        assistant message's text and hand the FULL burst over as an ordered
+        list on the terminal ResultMessage (uuid-deduped). Without a
+        callback, the historical WARN-drop stands."""
         if isinstance(message, _StreamEnd):
             return
         sid = getattr(message, "session_id", None)
@@ -783,15 +928,16 @@ class ClaudeAgentSdkSession:
                 )
                 return
             result_text = getattr(message, "result", None)
-            text = (
-                result_text
-                if isinstance(result_text, str) and result_text.strip()
-                else "\n".join(self._unsolicited_text).strip()
-            )
+            texts = list(self._unsolicited_text)
             self._unsolicited_text.clear()
+            if isinstance(result_text, str) and result_text.strip():
+                # The CLI's result text repeats the turn's final assistant
+                # message — never hand the same text over twice.
+                if not texts or texts[-1] != result_text:
+                    texts.append(result_text)
             if uuid:
                 self._unsolicited_delivered.add(uuid)
-            if not text:
+            if not texts:
                 logger.warning(
                     "claude-agent-sdk: unsolicited ResultMessage carried no "
                     "text (total=%d) — nothing to deliver",
@@ -799,30 +945,36 @@ class ClaudeAgentSdkSession:
                 )
                 return
             logger.info(
-                "claude-agent-sdk: delivering unsolicited result (background "
-                "task finished, total=%d, %d chars)",
-                self._unsolicited_results, len(text),
+                "claude-agent-sdk: delivering unsolicited result burst "
+                "(background task finished, total=%d, %d message(s), "
+                "%d chars)",
+                self._unsolicited_results, len(texts),
+                sum(len(t) for t in texts),
             )
             try:
-                self._on_unsolicited_result(text)
+                self._on_unsolicited_result(texts)
             except Exception:
                 logger.warning(
                     "claude-agent-sdk: unsolicited-result delivery callback "
                     "raised — answer may be lost", exc_info=True,
                 )
         elif name == "AssistantMessage":
-            # Buffer top-level text as the fallback answer body; subagent
-            # streams (parent_tool_use_id set) are noise — the same gate
+            # Buffer top-level text, one entry per message so the burst
+            # delivers in message granularity; subagent streams
+            # (parent_tool_use_id set) are noise — the same gate
             # _forward_stream_delta uses.
             if (
                 self._on_unsolicited_result is not None
                 and not getattr(message, "parent_tool_use_id", None)
             ):
-                for block in getattr(message, "content", None) or []:
-                    if type(block).__name__ == "TextBlock":
-                        block_text = getattr(block, "text", "") or ""
-                        if block_text:
-                            self._unsolicited_text.append(block_text)
+                parts = [
+                    getattr(block, "text", "") or ""
+                    for block in getattr(message, "content", None) or []
+                    if type(block).__name__ == "TextBlock"
+                ]
+                message_text = "\n".join(p for p in parts if p)
+                if message_text:
+                    self._unsolicited_text.append(message_text)
             logger.info(
                 "claude-agent-sdk: unsolicited %s outside a turn", name,
             )
@@ -895,7 +1047,9 @@ class ClaudeAgentSdkSession:
     def build_option_fields(self) -> dict[str, Any]:
         """The ClaudeAgentOptions field dict — plain data so tests can assert
         on it without importing the SDK."""
-        mcp_servers: dict[str, Any] = {}
+        # External servers first; the internal wrapper is set LAST so it
+        # always wins a name collision with a config.yaml entry.
+        mcp_servers: dict[str, Any] = _build_external_mcp_configs()
         if self._include_hermes_tools:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id
@@ -949,6 +1103,12 @@ class ClaudeAgentSdkSession:
             # back in via agent.claude_agent_sdk.setting_sources — see
             # _configured_setting_sources.
             "setting_sources": _configured_setting_sources(),
+            # Hermes has no AskUserQuestion answer channel: a tap approves the
+            # tool but the chosen option never reaches the CLI, so the tool
+            # dead-ends with "The user did not answer the questions." The model
+            # must ask in plain text (Telegram-compatible); full option-button
+            # mapping is a later feature.
+            "disallowed_tools": ["AskUserQuestion"],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
@@ -968,8 +1128,23 @@ class ClaudeAgentSdkSession:
 
     def _make_can_use_tool(self) -> Any:
         """Bridge SDK permission requests onto Hermes' approval callback.
-        Fail-closed: any callback failure denies."""
+        Fail-closed: any callback failure denies.
+
+        Silent-deny observability (P2.d): every deny that was NOT an
+        operator's choice is logged at INFO here — this is the choke point
+        every SDK-lane deny transits with tool name and honest reason in
+        hand (the 2026-08-06 incident's silent denies had no log line at
+        all). "denied by user" (with or without ": <text>") appears IFF a
+        human chose deny — W8/W11 reserved that wording — so the prefix is
+        the discriminator; operator denies are not silent and not logged
+        here. Honesty boundary: settings deny-rule hits on the SDK side
+        (the CLI consulting ~/.claude/settings.json deny rules, e.g. an
+        installer-only skills-dir rule) never invoke can_use_tool and never
+        transit hermes code — they are UNLOGGABLE here by construction;
+        operator-facing relief for that class is a separate deny-notice
+        feature decision."""
         approval_callback = self._approval_callback
+        hermes_session_id = self._hermes_session_id
 
         async def _can_use_tool(tool_name: str, tool_input: dict, context: Any):
             from claude_agent_sdk import (
@@ -978,18 +1153,56 @@ class ClaudeAgentSdkSession:
             )
 
             try:
-                choice = await asyncio.to_thread(
+                kwargs: dict = {"allow_permanent": False}
+                # tool_use_id correlation (P2.a): the SDK guarantees a
+                # non-empty context.tool_use_id — thread it through so a
+                # button tap resolves THIS prompt, not queue[0]. Opt-in via
+                # marker attribute: the CLI thread-local callback keeps its
+                # exact signature (same additive philosophy as the widened
+                # return channel).
+                if getattr(approval_callback, "_accepts_tool_use_id", False):
+                    kwargs["tool_use_id"] = (
+                        getattr(context, "tool_use_id", "") or ""
+                    )
+                result = await asyncio.to_thread(
                     approval_callback,
                     f"{tool_name}({_tool_preview(tool_name, tool_input)})",
                     f"Claude requests tool {tool_name}",
-                    allow_permanent=False,
+                    **kwargs,
                 )
             except Exception:
                 logger.exception("approval_callback raised on SDK permission")
+                logger.info(
+                    "claude-agent-sdk: silent deny (no operator choice): "
+                    "tool=%s reason=%s session=%s",
+                    tool_name, "approval callback failed", hermes_session_id,
+                )
                 return PermissionResultDeny(message="approval callback failed")
+            # Widened callback contract: a plain choice string, or a dict
+            # {"choice": str, "reason": str} carrying an honest deny reason
+            # (no-approver / timeout / notify-failure / teardown-expiry).
+            # "denied by user" is reserved for a real human deny — a
+            # reason-bearing deny must never be attributed to the user.
+            reason = None
+            choice = result
+            if isinstance(result, dict):
+                reason = result.get("reason")
+                choice = result.get("choice")
             if choice in ("once", "session", "always"):
                 return PermissionResultAllow()
-            return PermissionResultDeny(message="denied by user")
+            if choice == "timeout" and not reason:
+                # The CLI thread-local callback surfaces its prompt timeout
+                # as a bare string; mapping it to the user-deny default
+                # would fabricate attribution for a prompt nobody answered.
+                reason = "approval timed out — no operator response"
+            message = reason or "denied by user"
+            if not message.startswith("denied by user"):
+                logger.info(
+                    "claude-agent-sdk: silent deny (no operator choice): "
+                    "tool=%s reason=%s session=%s",
+                    tool_name, message, hermes_session_id,
+                )
+            return PermissionResultDeny(message=message)
 
         return _can_use_tool
 

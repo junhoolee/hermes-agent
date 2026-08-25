@@ -49,6 +49,8 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
+from agent.redact import redact_sensitive_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -2067,7 +2069,14 @@ class ProcessRegistry:
                             s.host_start_time = self._safe_host_start_time(s.pid)
                         entries.append({
                             "session_id": s.id,
-                            "command": s.command,
+                            # Redact inline credentials before persisting to
+                            # disk — the checkpoint file lives under
+                            # ~/.hermes/processes.json with the raw command
+                            # (issue #77484). Recovery only uses command for
+                            # display/logging (the process is already running;
+                            # adoption re-validates the PID, never re-runs the
+                            # command), so masking is lossless.
+                            "command": redact_sensitive_text(s.command, code_file=True),
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
@@ -2219,7 +2228,18 @@ def _format_async_delegation(evt: dict) -> str:
     """
     import time as _time
 
-    deleg_id = evt.get("delegation_id", "unknown")
+    deleg_id = evt.get("delegation_id")
+    if not deleg_id:
+        # No real delegation behind this event (synthetic/echo lane) — never
+        # render a completion envelope for it; empty text makes the watcher
+        # skip injection entirely.
+        logger.warning(
+            "async-delegation completion with empty delegation_id dropped "
+            "(goal=%r, status=%r) — envelope not rendered",
+            evt.get("goal", ""),
+            evt.get("status"),
+        )
+        return ""
     goal = evt.get("goal", "") or ""
     context = evt.get("context")
     toolsets = evt.get("toolsets")
@@ -2493,7 +2513,12 @@ def _handle_process(args, **kw):
         except Exception:
             session_key = ""
         return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
+            {
+                "processes": [
+                    _redact_process_result(p)
+                    for p in process_registry.list_sessions(task_id=task_id, session_key=session_key or None)
+                ]
+            },
             ensure_ascii=False,
         )
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:

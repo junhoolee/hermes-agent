@@ -392,6 +392,17 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
     return None
 
 
+def telegram_deps_present() -> bool:
+    """PASSIVE probe: is python-telegram-bot importable right now?
+
+    Registry ``check_fn`` — called from status displays and config loading,
+    so it must never install anything.  The ACTIVE lazy-installer
+    (``check_telegram_requirements``) is registered as ``ensure_deps_fn``
+    and runs from ``create_adapter()`` when this returns False (#79812).
+    """
+    return TELEGRAM_AVAILABLE
+
+
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
 
@@ -567,6 +578,11 @@ def _rich_normalize_linebreaks(text: str) -> str:
 # reconnect/teardown ladder. This is an internal safety bound (not a user knob),
 # applied identically at every stop() site so no path can hang on a dead socket.
 _UPDATER_STOP_TIMEOUT = 15.0
+# Per-step bound for disconnect() awaits that are not updater.stop() itself.
+# Kept short so a cancellation-swallowing lifecycle/PTB close cannot burn the
+# gateway's whole fatal-handler budget before the reconnect queue is useful
+# (#80598). updater.stop() keeps the longer _UPDATER_STOP_TIMEOUT.
+_DISCONNECT_STEP_TIMEOUT = 2.0
 # start_polling() can also hang when the connection pool is in a degraded state
 # after _drain_polling_connections(), particularly when both primary and fallback
 # Telegram endpoints are unreachable. Bounding start_polling() prevents the
@@ -853,7 +869,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # approval_id → (session_key, tool_use_id); legacy plain-string
+        # session_key values are tolerated by the tap handler.
+        self._approval_state: Dict[int, Any] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -4292,6 +4310,47 @@ class TelegramAdapter(BasePlatformAdapter):
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
             self._polling_progress_verifier_task = None
 
+    async def _await_disconnect_step(self, awaitable, timeout: float, step: str) -> bool:
+        """Await one disconnect step; detach on timeout so teardown advances.
+
+        ``asyncio.wait_for`` cancels an overdue child but then waits for it to
+        exit. Lifecycle / PTB close paths that swallow ``CancelledError`` on a
+        half-dead socket can therefore wedge disconnect forever (#80598).
+        Detach at the deadline and continue — the abandoned task is observed
+        via ``_consume_abandoned_task``.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            if timeout <= 0:
+                done, _pending = await asyncio.wait({task})
+            else:
+                done, _pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            # Outer cancellation (e.g. the fatal handler's outer timeout) must
+            # not orphan the inner task — asyncio.wait does NOT cancel its
+            # futures when itself cancelled (#80598).  Mirror the pattern used
+            # by GatewayRunner._await_adapter_cleanup_with_timeout.
+            task.cancel()
+            task.add_done_callback(_consume_abandoned_task)
+            raise
+        if task in done:
+            # Intentional cancels (heartbeat / identity / lifecycle) surface as
+            # CancelledError — swallow so disconnect keeps advancing.
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return True
+        task.cancel()
+        task.add_done_callback(_consume_abandoned_task)
+        logger.warning(
+            "[%s] %s timed out after %.1fs during disconnect; continuing teardown",
+            self.name,
+            step,
+            timeout,
+        )
+        return False
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         # Mark disconnected first so the drop guard short-circuits any flush
@@ -4303,6 +4362,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
+
+        # Release the bot-token lock immediately so a wedged close cannot block
+        # the reconnect watcher from acquiring it (#80598). The rest of teardown
+        # is best-effort against a half-dead transport.
+        self._release_platform_lock()
 
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the
@@ -4324,7 +4388,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if asyncio.isfuture(task) or asyncio.iscoroutine(task):
                 lifecycle_tasks.append(task)
         if lifecycle_tasks:
-            await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
+            await self._await_disconnect_step(
+                asyncio.gather(*lifecycle_tasks, return_exceptions=True),
+                _DISCONNECT_STEP_TIMEOUT,
+                "lifecycle-task cancel",
+            )
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -4342,7 +4410,11 @@ class TelegramAdapter(BasePlatformAdapter):
         post_connect_task = getattr(self, "_post_connect_task", None)
         if post_connect_task and not post_connect_task.done():
             post_connect_task.cancel()
-            await asyncio.gather(post_connect_task, return_exceptions=True)
+            await self._await_disconnect_step(
+                asyncio.gather(post_connect_task, return_exceptions=True),
+                _DISCONNECT_STEP_TIMEOUT,
+                "post-connect cancel",
+            )
         self._post_connect_task = None
 
         # Cancel the heartbeat before tearing down the app so the probe task
@@ -4350,10 +4422,11 @@ class TelegramAdapter(BasePlatformAdapter):
         polling_heartbeat_task = getattr(self, "_polling_heartbeat_task", None)
         if polling_heartbeat_task and not polling_heartbeat_task.done():
             polling_heartbeat_task.cancel()
-            try:
-                await polling_heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            await self._await_disconnect_step(
+                polling_heartbeat_task,
+                _DISCONNECT_STEP_TIMEOUT,
+                "heartbeat cancel",
+            )
         self._polling_heartbeat_task = None
 
         # Cancel the webhook-mode identity refresh loop on the same fence as
@@ -4361,10 +4434,11 @@ class TelegramAdapter(BasePlatformAdapter):
         identity_task = getattr(self, "_bot_identity_refresh_task", None)
         if identity_task and not identity_task.done():
             identity_task.cancel()
-            try:
-                await identity_task
-            except asyncio.CancelledError:
-                pass
+            await self._await_disconnect_step(
+                identity_task,
+                _DISCONNECT_STEP_TIMEOUT,
+                "identity-refresh cancel",
+            )
         self._bot_identity_refresh_task = None
 
         # Mark the bot "Offline" in its short description while the bot's HTTP
@@ -4373,11 +4447,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # a hard crash leaves the last-known status, which is the expected
         # limitation of a profile-text indicator.
         try:
-            await self._set_status_indicator(online=False)
+            await self._await_disconnect_step(
+                self._set_status_indicator(online=False),
+                _DISCONNECT_STEP_TIMEOUT,
+                "status-indicator update",
+            )
         except Exception:
             pass
 
-        await self._cancel_pending_delivery_tasks()
+        await self._await_disconnect_step(
+            self._cancel_pending_delivery_tasks(),
+            _DISCONNECT_STEP_TIMEOUT,
+            "pending-delivery cancel",
+        )
 
         if self._app:
             try:
@@ -4388,22 +4470,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 # we fall through to app.stop()/shutdown() to force teardown.
                 if self._app.updater and self._app.updater.running:
                     try:
-                        await asyncio.wait_for(self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "[%s] updater.stop() timed out during disconnect "
-                            "(likely CLOSE-WAIT socket); forcing app shutdown",
-                            self.name,
+                        await self._await_disconnect_step(
+                            self._app.updater.stop(),
+                            _UPDATER_STOP_TIMEOUT,
+                            "updater.stop()",
                         )
+                    except Exception as stop_error:
+                        logger.warning(
+                            "[%s] updater.stop() failed during disconnect: %s",
+                            self.name,
+                            _redact_telegram_error_text(stop_error),
+                        )
+                # app.stop()/shutdown() can also block on a half-dead httpx
+                # pool. Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
-                    await self._app.stop()
-                await self._app.shutdown()
+                    await self._await_disconnect_step(
+                        self._app.stop(),
+                        _DISCONNECT_STEP_TIMEOUT,
+                        "app.stop()",
+                    )
+                await self._await_disconnect_step(
+                    self._app.shutdown(),
+                    _DISCONNECT_STEP_TIMEOUT,
+                    "app.shutdown()",
+                )
             except Exception as e:
                 logger.warning(
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
-        self._release_platform_lock()
 
         self._app = None
         self._bot = None
@@ -5446,6 +5541,7 @@ class TelegramAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        tool_use_id: str = "",
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -5507,8 +5603,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Store (session_key, tool_use_id) keyed by approval_id for the
+            # callback handler. The prompt correlator rides the adapter-side
+            # map, NOT callback_data: Telegram caps callback_data at 64
+            # bytes — "ea:session:" (11B) plus a toolu_… id (~30–45B, length
+            # not contractually bounded) would usually fit, but the map
+            # already exists, keeps int-parsing and stale pre-deploy buttons
+            # byte-identical, and removes the cap risk entirely.
+            self._approval_state[approval_id] = (session_key, tool_use_id or "")
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6371,10 +6473,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
+                _entry = self._approval_state.pop(approval_id, None)
+                if not _entry:
                     await query.answer(text="This approval has already been resolved.")
                     return
+                if isinstance(_entry, tuple):
+                    session_key, tool_use_id = _entry
+                else:
+                    # Legacy plain-string value (pre-correlator writer in a
+                    # mixed state): session key only, FIFO resolution.
+                    session_key, tool_use_id = _entry, ""
 
                 user_display = getattr(query.from_user, "first_name", "User")
 
@@ -6386,7 +6494,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 # regression follow-up: 60s waits made stale taps common).
                 try:
                     from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    # tool_use_id present → resolve the MATCHING prompt
+                    # (parallel prompts: FIFO let tap-B grant prompt A);
+                    # absent → FIFO fallback, logged by tools.approval.
+                    count = resolve_gateway_approval(
+                        session_key, choice,
+                        tool_use_id=tool_use_id or None,
+                    )
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,
@@ -10131,7 +10245,8 @@ def register(ctx) -> None:
         name="telegram",
         label="Telegram",
         adapter_factory=_build_adapter,
-        check_fn=check_telegram_requirements,
+        check_fn=telegram_deps_present,
+        ensure_deps_fn=check_telegram_requirements,
         is_connected=_is_connected,
         required_env=["TELEGRAM_BOT_TOKEN"],
         install_hint="Run `hermes setup` to install Telegram support.",

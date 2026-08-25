@@ -11,10 +11,13 @@ retire the client rather than silently continue.
 """
 
 import asyncio
+import logging
+import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -39,10 +42,22 @@ def _isolate_provider_config(monkeypatch):
     metered-billing refusal assertions, and a real `append_file` would leak into
     the system-prompt tests. Default to an empty block; tests that care patch
     `load_config_readonly` themselves (the last patch wins).
+
+    Same hermeticity for the external-MCP merge: build_option_fields() reads
+    config.yaml's `mcp_servers:` through the session module's
+    `_load_mcp_config` seam, so without this stub EVERY test that builds
+    options would pull the developer's real slack/notion servers into
+    `mcp_servers`. Stub the seam to an empty catalog; the external-merge
+    tests override it per-test. raising=False because the seam does not
+    exist until the merge is implemented (RED phase).
     """
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
     import hermes_cli.config as cfg
 
     monkeypatch.setattr(cfg, "load_config_readonly", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(
+        sdk_session_mod, "_load_mcp_config", lambda *a, **k: {}, raising=False
+    )
 
 
 # ---------- SDK stand-in types (duck-typed by class NAME) ----------
@@ -432,6 +447,13 @@ class TestSession:
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
+    def test_askuserquestion_in_disallowed_tools(self):
+        # No answer channel for AskUserQuestion in hermes — the model must
+        # ask in plain text; the tool is removed from its context.
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        fields = session.build_option_fields()
+        assert fields["disallowed_tools"] == ["AskUserQuestion"]
+
     def test_config_permission_mode_overrides_env_mapping(self, monkeypatch):
         # agent.claude_agent_sdk.permission_mode (an SDK literal) wins over
         # the HERMES_TERMINAL_SECURITY_MODE mapping; explicit constructor
@@ -567,6 +589,292 @@ class TestSession:
         turn = session.run_turn("hi")
         assert turn.should_retire
         assert "ANTHROPIC_API_KEY" in (turn.error or "")
+
+
+# ---------- external MCP servers from config.yaml (mcp_servers:) ----------
+
+
+def _patch_external_mcp(monkeypatch, servers):
+    """Point the session module's config.yaml `mcp_servers:` seam at `servers`.
+
+    raising=False on purpose: pre-fix the seam does not exist yet, and these
+    tests must go RED on the MISSING MERGE (the assertions below), never on
+    monkeypatch plumbing."""
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+    monkeypatch.setattr(
+        sdk_session_mod,
+        "_load_mcp_config",
+        lambda *a, **k: dict(servers),
+        raising=False,
+    )
+
+
+def _patch_oauth_tokens(monkeypatch, result):
+    """Point the session module's cached-OAuth-token seam
+    (`_has_oauth_tokens(server_name)`) at a canned result; pass a callable
+    to script a raising probe. raising=False on purpose: pre-fix the seam
+    does not exist yet, and these tests must go RED on the ROUTING
+    assertions below, never on monkeypatch plumbing. It also keeps every
+    test hermetic against the developer's REAL ~/.hermes/mcp-tokens/
+    directory — a box with a live notion login must not flip outcomes."""
+    import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+    fn = result if callable(result) else (lambda name: result)
+    monkeypatch.setattr(sdk_session_mod, "_has_oauth_tokens", fn, raising=False)
+
+
+class TestExternalMcpServers:
+    """config.yaml `mcp_servers:` entries must reach the SDK's mcp_servers
+    dict. Today build_option_fields() registers ONLY the internal
+    hermes-tools wrapper, so every external server (slack stdio, notion
+    remote, ...) is silently invisible to the model on this runtime — the
+    tools work on the native path and vanish on the fallback."""
+
+    def test_enabled_stdio_server_merged(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "slack": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-slack"],
+                "env": {"SLACK_BOT_TOKEN": "xoxb-fake"},
+            },
+        })
+        session, _ = _make_session()
+        fields = session.build_option_fields()
+        assert fields["mcp_servers"]["slack"] == {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-slack"],
+            "env": {"SLACK_BOT_TOKEN": "xoxb-fake"},
+        }
+        # The internal wrapper still rides along untouched.
+        assert "hermes-tools" in fields["mcp_servers"]
+
+    def test_disabled_server_excluded(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "slack": {"command": "npx", "enabled": False},
+            "notion": {"url": "https://mcp.notion.com/mcp"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "slack" not in servers
+        assert "notion" in servers  # the sibling stays — no over-filtering
+
+    def test_enabled_flag_stringy(self, monkeypatch):
+        # config.yaml booleans arrive in every YAML spelling; membership
+        # follows _parse_enabled_flag semantics (missing/unrecognized = on).
+        _patch_external_mcp(monkeypatch, {
+            "off-string": {"command": "a", "enabled": "false"},
+            "off-zero": {"command": "b", "enabled": 0},
+            "on-string": {"command": "c", "enabled": "yes"},
+            "on-default": {"command": "d"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "off-string" not in servers
+        assert "off-zero" not in servers
+        assert "on-string" in servers
+        assert "on-default" in servers
+
+    def test_http_server_shape(self, monkeypatch):
+        # A remote OAuth server with NO cached Hermes tokens keeps today's
+        # bare-http fallback: still a VALID config (visible + diagnosable in
+        # the SDK CLI), never a crash, never corrupted siblings. Hermes-only
+        # keys (auth, timeout, ...) are not forwarded to the SDK. The
+        # authenticated case routes through the stdio OAuth proxy instead —
+        # see TestOAuthProxyRouting.
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, False)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"] == {
+            "type": "http",
+            "url": "https://mcp.notion.com/mcp",
+        }
+
+    def test_sse_server_shape(self, monkeypatch):
+        # transport: sse + url wins over the plain-http mapping — the same
+        # precedence the native MCPServerTask transport selection applies.
+        _patch_external_mcp(monkeypatch, {
+            "events": {"url": "https://example.com/sse", "transport": "sse"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["events"] == {
+            "type": "sse",
+            "url": "https://example.com/sse",
+        }
+
+    def test_http_headers_passed_through(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "api": {
+                "url": "https://api.example.com/mcp",
+                "headers": {"Authorization": "Bearer tok-1"},
+            },
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["api"] == {
+            "type": "http",
+            "url": "https://api.example.com/mcp",
+            "headers": {"Authorization": "Bearer tok-1"},
+        }
+
+    def test_reserved_name_not_overridden(self, monkeypatch):
+        # A config.yaml entry named hermes-tools must never displace the
+        # internal wrapper — the wrapper is set LAST and wins on collision.
+        _patch_external_mcp(monkeypatch, {
+            "hermes-tools": {"command": "/usr/bin/evil", "args": ["--pwn"]},
+            "slack": {"command": "npx"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["hermes-tools"]["command"] != "/usr/bin/evil"
+        assert servers["hermes-tools"]["args"] == [
+            "-m", "agent.transports.hermes_tools_mcp_server",
+        ]
+        assert "slack" in servers  # the benign sibling still merges
+
+    def test_include_hermes_tools_false_still_lists_external(self, monkeypatch):
+        # include_hermes_tools=False drops ONLY the internal wrapper; the
+        # operator's own servers are independent of that switch.
+        _patch_external_mcp(monkeypatch, {"slack": {"command": "npx"}})
+        session, _ = _make_session(include_hermes_tools=False)
+        servers = session.build_option_fields()["mcp_servers"]
+        assert "hermes-tools" not in servers
+        assert "slack" in servers
+
+    def test_malformed_entry_skipped(self, monkeypatch):
+        # Neither url nor command → nothing to launch; a non-dict entry is
+        # config noise. Both are skipped without dragging down siblings.
+        _patch_external_mcp(monkeypatch, {
+            "broken": {"timeout": 30},
+            "not-a-dict": "https://example.com/mcp",
+            "ok": {"command": "srv"},
+        })
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert "broken" not in servers
+        assert "not-a-dict" not in servers
+        assert servers["ok"] == {
+            "type": "stdio", "command": "srv", "args": [], "env": {},
+        }
+
+    def test_external_config_failure_is_soft(self, monkeypatch):
+        # An unreadable/corrupt config must never take the session down —
+        # the merge degrades to the internal wrapper alone.
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr(
+            sdk_session_mod, "_load_mcp_config", _boom, raising=False
+        )
+        session, _ = _make_session()
+        fields = session.build_option_fields()  # must not raise
+        assert set(fields["mcp_servers"]) == {"hermes-tools"}
+        # The helper itself is the soft-failure boundary: {} on any error.
+        assert sdk_session_mod._build_external_mcp_configs() == {}
+
+
+# ---------- OAuth stdio proxy routing (mcp_servers: auth: oauth) ----------
+
+
+class TestOAuthProxyRouting:
+    """A remote `auth: oauth` entry whose tokens are cached in Hermes's own
+    store (~/.hermes/mcp-tokens/, via HermesTokenStorage) must route through
+    the Hermes-side stdio OAuth proxy (agent.transports.oauth_mcp_proxy) —
+    the same spawn-a-python-stdio-server pattern as hermes-tools — because
+    the SDK-spawned CLI can never read Hermes's token store itself. Without
+    cached tokens the entry keeps today's bare-http fallback: a doomed proxy
+    is never spawned, and the raw entry stays visible/diagnosable instead of
+    silently vanishing."""
+
+    def test_oauth_entry_with_tokens_becomes_stdio_proxy(self, monkeypatch):
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        entry = servers["notion"]
+        assert entry["type"] == "stdio"
+        assert entry["command"] == sys.executable
+        # The child re-reads config.yaml + the token store itself, so argv
+        # carries only the server name — no URL, no secrets.
+        assert entry["args"] == [
+            "-m", "agent.transports.oauth_mcp_proxy", "--server", "notion",
+        ]
+        # Same env discipline as the hermes-tools wrapper: repo root on
+        # PYTHONPATH so `-m` resolves, and no raw http fields left behind.
+        assert "PYTHONPATH" in entry["env"]
+        assert "url" not in entry
+        assert "headers" not in entry
+
+    def test_oauth_entry_tokens_probed_by_server_name(self, monkeypatch):
+        # The token probe must key on the config entry NAME (that is what
+        # HermesTokenStorage files are keyed by), not the URL.
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+            "linear": {"url": "https://mcp.linear.app/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, lambda name: name == "notion")
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"]["type"] == "stdio"
+        assert servers["linear"] == {
+            "type": "http", "url": "https://mcp.linear.app/mcp",
+        }
+
+    def test_token_probe_crash_falls_back_to_bare_http(self, monkeypatch):
+        # A broken token dir (perms, corrupt profile) must degrade to
+        # today's no-auth behavior — never take the whole merge down.
+        def _boom(name):
+            raise RuntimeError("token dir unreadable")
+
+        _patch_external_mcp(monkeypatch, {
+            "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"},
+        })
+        _patch_oauth_tokens(monkeypatch, _boom)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["notion"] == {
+            "type": "http", "url": "https://mcp.notion.com/mcp",
+        }
+
+    def test_oauth_sse_entry_keeps_raw_sse(self, monkeypatch):
+        # Scoped: the proxy speaks streamable HTTP to the remote. An
+        # `transport: sse` OAuth entry keeps today's raw sse emission until
+        # the proxy grows an SSE client path.
+        _patch_external_mcp(monkeypatch, {
+            "events": {
+                "url": "https://example.com/sse",
+                "transport": "sse",
+                "auth": "oauth",
+            },
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["events"] == {
+            "type": "sse", "url": "https://example.com/sse",
+        }
+
+    def test_non_oauth_entry_never_probes_tokens(self, monkeypatch):
+        # `auth: oauth` is the ONLY trigger (mcp_tool.py:3060 semantics);
+        # a plain http entry stays plain even when a token file exists.
+        _patch_external_mcp(monkeypatch, {
+            "api": {"url": "https://api.example.com/mcp"},
+        })
+        _patch_oauth_tokens(monkeypatch, True)
+        servers = _make_session()[0].build_option_fields()["mcp_servers"]
+        assert servers["api"] == {
+            "type": "http", "url": "https://api.example.com/mcp",
+        }
+
+    def test_has_oauth_tokens_reads_hermes_token_store(self, tmp_path, monkeypatch):
+        # The seam itself: backed by HermesTokenStorage's on-disk layout
+        # (HERMES_HOME/mcp-tokens/<server>.json), Hermes's single source of
+        # truth for MCP OAuth state.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mcp-tokens").mkdir()
+        (tmp_path / "mcp-tokens" / "notion.json").write_text("{}")
+        from agent.transports.claude_agent_sdk_session import _has_oauth_tokens
+
+        assert _has_oauth_tokens("notion") is True
+        assert _has_oauth_tokens("linear") is False
 
 
 # ---------- runtime glue ----------
@@ -930,7 +1238,17 @@ class TestStreamOwnership:
         # not served as the next turn's answer. (Mid-flight overlap — the one
         # window the idle-time tests above don't cover. Ported from the
         # independent re-derivation of this fix, commit 09537f965.)
+        #
+        # Updated pin (2026-08-07): the original version routed ALL residue
+        # to the background-delivery lane with no content discrimination —
+        # which ships a turn's OWN answer as a fake background completion,
+        # the 2026-08-06 incident class. New intent: residue never becomes
+        # the next turn's answer (unchanged) AND the delivery lane splits by
+        # content — genuinely different residue (this test) still delivers
+        # as a background burst; own-answer residue is suppressed (see
+        # test_own_answer_residue_never_delivered_as_background_result).
         holder = {}
+        got = []
 
         class OverlappingClient(_FakeClient):
             async def query(self, text):
@@ -951,7 +1269,9 @@ class TestStreamOwnership:
             holder["client"] = client
             return client
 
-        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
         try:
             first = session.run_turn("one", turn_timeout=15.0)
             assert first.final_text == "FIRST"
@@ -962,6 +1282,141 @@ class TestStreamOwnership:
         finally:
             session.close()
         assert second.final_text == "SECOND"
+        # Delivery split: differing residue is a REAL background completion —
+        # it must still reach the delivery lane, not be swallowed.
+        assert got == [["RESIDUE from an overlapping CLI turn"]]
+
+    def test_own_answer_residue_never_delivered_as_background_result(
+        self, caplog
+    ):
+        # D2 rework (2026-08-06 incident class): a residue ResultMessage that
+        # repeats the just-finished turn's OWN answer must be suppressed —
+        # dedup-marked and WARN'd, never handed to the background-delivery
+        # callback as a fake completion.
+        holder = {}
+        got = []
+
+        class OwnEchoClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                if len(self.queried) == 1:
+                    self._pending.append(ResultMessage(result="FIRST", uuid="f-1"))
+                    self._pending.append(
+                        ResultMessage(result="FIRST", uuid="own-dup")
+                    )
+                else:
+                    self._pending.append(ResultMessage(result="SECOND", uuid="s-1"))
+
+        def factory(options=None):
+            client = OwnEchoClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="agent.transports.claude_agent_sdk_session"
+        ):
+            try:
+                first = session.run_turn("one", turn_timeout=15.0)
+                assert first.final_text == "FIRST"
+                # run_turn returns only after the residue drain — the
+                # suppression already happened; a bounded wait just proves
+                # nothing arrives late either.
+                self._wait(lambda: got, timeout=0.5)
+                second = session.run_turn("two", turn_timeout=15.0)
+            finally:
+                session.close()
+        assert got == [], "own-answer residue was delivered as a fake background result"
+        assert second.final_text == "SECOND"
+        assert session._unsolicited_results == 1  # routed away, still counted
+        assert "own-dup" in session._unsolicited_delivered
+        assert any(
+            "matches this turn's own answer" in r.getMessage()
+            for r in caplog.records
+        ), "suppression must WARN, never silently drop"
+
+    def test_genuine_overlap_residue_still_delivers_as_burst(self):
+        # The delivery split's other half, explicit: residue with DIFFERENT
+        # content is deliver_background_results working — never suppressed.
+        holder = {}
+        got = []
+
+        class OverlapClient(_FakeClient):
+            async def query(self, text):
+                self.queried.append(text)
+                self._pending.append(ResultMessage(result="FIRST", uuid="f-1"))
+                self._pending.append(
+                    ResultMessage(result="DIFFERENT bg completion", uuid="bg-9")
+                )
+
+        def factory(options=None):
+            client = OverlapClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp", client_factory=factory, on_unsolicited_result=got.append
+        )
+        try:
+            first = session.run_turn("one", turn_timeout=15.0)
+            assert first.final_text == "FIRST"
+            assert self._wait(lambda: got, timeout=5.0)
+        finally:
+            session.close()
+        assert got == [["DIFFERENT bg completion"]]
+
+    def test_stale_unsolicited_text_never_attaches_to_later_result(
+        self, caplog
+    ):
+        # Leak fix: text buffered idle-time whose terminal ResultMessage never
+        # arrived is discarded (with WARN) at the next turn's start — a later
+        # unrelated result must never pick it up as its own burst.
+        got = []
+        session, holder = _make_session(
+            script=[
+                AssistantMessage(content=[TextBlock("fresh answer")]),
+                ResultMessage(result="fresh answer", uuid="fresh-1"),
+            ],
+            on_unsolicited_result=got.append,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="agent.transports.claude_agent_sdk_session"
+        ):
+            try:
+                session.ensure_started()
+                # A background turn started streaming but its result never
+                # came (CLI died / mid-burst) — text sits in the buffer.
+                holder["client"].feed(
+                    AssistantMessage(content=[TextBlock("orphaned partial text")])
+                )
+                assert self._wait(lambda: session._unsolicited_text)
+                turn = session.run_turn("new question", turn_timeout=15.0)
+                assert turn.final_text == "fresh answer"
+                # A later, unrelated background completion arrives idle-time.
+                holder["client"].feed(
+                    ResultMessage(result="unrelated bg answer", uuid="bg-x")
+                )
+                assert self._wait(lambda: got)
+            finally:
+                session.close()
+        assert got == [["unrelated bg answer"]], (
+            "stale pre-turn text misattached to an unrelated later result"
+        )
+        assert any(
+            "stale unsolicited text" in r.getMessage()
+            for r in caplog.records
+        ), "turn-start discard must WARN, never silently drop"
+
+    @staticmethod
+    def _wait(cond, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
 
     def test_stream_death_mid_turn_fails_fast_instead_of_hanging(self):
         # A script with no ResultMessage models the CLI dying mid-turn. The
@@ -1532,6 +1987,26 @@ class TestContinuity:
         assert "shadowed imports" in sent
         assert sent.endswith("and the tests?")
 
+    def test_projected_bg_row_excluded_from_continuity_digest(self):
+        # Binding amendment (sdk-echo-approval-fixes): rows projected by the
+        # background-result lane are the agent's OWN delivered answers —
+        # the digest re-presenting them is double-presentation, the exact
+        # pathology the lane fixes. Marked rows never enter the digest.
+        from agent.claude_sdk_runtime import _render_continuity_digest
+
+        digest = _render_continuity_digest([
+            {"role": "user", "content": "run the research"},
+            {
+                "role": "assistant",
+                "content": "the full background report",
+                "display_kind": "sdk_background_result",
+            },
+            {"role": "assistant", "content": "a normal reply"},
+        ])
+        assert "the full background report" not in digest
+        assert "run the research" in digest
+        assert "a normal reply" in digest
+
     def test_no_digest_on_brand_new_conversation(self, monkeypatch):
         agent, _db = self._db_agent(persisted_sdk_id=None)
         instances = self._spy_sessions(monkeypatch, [_make_turn()])
@@ -2057,6 +2532,22 @@ class TestSystemPromptAppend:
         assert out is not None
         assert "session_search" in out
 
+    def test_system_prompt_steers_to_hermes_skill_tool(self, tmp_path, monkeypatch):
+        # Gap 2: on this runtime the model's BUILT-IN Skill tool resolves the
+        # Claude-Code-bundled catalog, NOT Hermes' skill library — a genuine
+        # Hermes skill comes back "Unknown skill". Hermes skills are only
+        # reachable through the hermes-tools shims (skills_list/skill_view),
+        # so the append must steer explicitly, and must do so even on a box
+        # whose skills index renders empty (the steering is about the TOOLS,
+        # not the catalog contents).
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append() or ""
+        assert "skills_list" in out
+        assert "skill_view" in out
+        assert "Do NOT use the built-in Skill tool" in out
+
 
 class TestAuxLaneFailClosed:
     def test_aux_auto_detect_disabled_under_claude_sdk(self, monkeypatch):
@@ -2229,6 +2720,34 @@ class TestFatalReason:
         assert "failure_reason" not in result
 
 
+# ---------- SDK permission-result stand-ins (planted as the module) ----------
+# _make_can_use_tool lazy-imports PermissionResultAllow/Deny from
+# claude_agent_sdk at CALL time — the only import of the real SDK package any
+# test in this file can reach. Upstream CI installs no claude-agent-sdk
+# extra, so tests that INVOKE the callback must plant a stand-in module
+# first (the header's contract: stand-in classes named like the SDK's
+# types). Planted unconditionally: the tests exercise identical code
+# whether or not the real SDK is installed.
+
+
+class PermissionResultAllow:
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
+
+
+class PermissionResultDeny:
+    def __init__(self, message: str = "", **kwargs: Any) -> None:
+        self.message = message
+        self.__dict__.update(kwargs)
+
+
+def _plant_claude_agent_sdk_stand_in(monkeypatch) -> None:
+    module = ModuleType("claude_agent_sdk")
+    module.PermissionResultAllow = PermissionResultAllow
+    module.PermissionResultDeny = PermissionResultDeny
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+
+
 # ---------- gateway approval bridge: SDK permission prompts reach the chat ----------
 # Production finding (dasbrow 24/7 box): under the gateway, _create_session's
 # thread-local CLI callback is always None, so mode=default wired
@@ -2239,6 +2758,10 @@ class TestFatalReason:
 
 
 class TestGatewayApprovalBridge:
+    @pytest.fixture(autouse=True)
+    def _sdk_permission_results(self, monkeypatch):
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
+
     def _gateway_ctx(self, monkeypatch, session_key):
         from tools import approval as approval_mod
 
@@ -2256,13 +2779,31 @@ class TestGatewayApprovalBridge:
         assert build_sdk_gateway_approval_callback() is None
 
     def test_builder_returns_none_for_cron_sessions(self, monkeypatch):
-        # A nightly turn must never block on a prompt: cron keeps the
-        # settings.json allowlist-or-deny posture.
+        # UPDATED (W9): this test used to pin builder→None for cron contexts
+        # — which FROZE a session first created during a cron turn into
+        # callback=None forever (silent deny in every later interactive
+        # turn, the sticky-session incident defect). The builder now wires a
+        # callback for any gateway-shaped surface and resolves cron-ness per
+        # CALL. Cron posture is preserved: settings allow-rules suppress
+        # prompts before can_use_tool is consulted, and a would-be prompt
+        # during a cron turn denies IMMEDIATELY with an honest reason —
+        # never blocks, never pages, never enqueues.
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
-        from tools.approval import build_sdk_gateway_approval_callback
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        from tools import approval as approval_mod
 
-        assert build_sdk_gateway_approval_callback() is None
+        cb = approval_mod.build_sdk_gateway_approval_callback()
+        assert cb is not None  # gateway-shaped: no more cron-born freeze
+        result = cb("Bash(ls)", "Claude requests tool Bash")
+        assert result == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert "denied by user" not in result["reason"]
+        # Never blocked, never enqueued: no pending approval anywhere.
+        with approval_mod._lock:
+            assert not approval_mod._gateway_queues
 
     def test_gateway_context_wires_can_use_tool(self, monkeypatch):
         approval_mod, token = self._gateway_ctx(monkeypatch, "tg:152:main")
@@ -2276,13 +2817,517 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.reset_current_session_key(token)
 
-    def test_no_registered_notify_denies(self, monkeypatch):
+    def test_no_registered_notify_denies(self, monkeypatch, caplog):
+        # UPDATED (W8): this test used to pin the bare-"deny" return — which
+        # the SDK layer translated to "denied by user" for a prompt no user
+        # ever saw, with no log line (the 2026-08-06 incident's approval
+        # face). The no-approver deny is now structured with an honest
+        # reason and logged at WARNING.
         approval_mod, token = self._gateway_ctx(monkeypatch, "sess-no-notify")
         try:
             cb = approval_mod.build_sdk_gateway_approval_callback()
-            assert cb("Bash(ls)", "Claude requests tool Bash") == "deny"
+            with caplog.at_level(logging.WARNING, logger="tools.approval"):
+                result = cb("Bash(ls)", "Claude requests tool Bash")
+            assert result == {
+                "choice": "deny",
+                "reason": "no approver available (background context)",
+            }
+            assert any(
+                "NO approver available" in r.getMessage()
+                and "Bash(ls)" in r.getMessage()
+                and "sess-no-notify" in r.getMessage()
+                for r in caplog.records
+            ), "the silent deny must not stay silent"
         finally:
             approval_mod.reset_current_session_key(token)
+
+    def test_background_turn_pages_operator_via_session_scoped_approver(
+        self, monkeypatch,
+    ):
+        # The incident lane: deliver_background_results expects CLI-initiated
+        # turns BETWEEN hermes turns — exactly when the turn-scoped
+        # registration is gone. The session-scoped entry (refreshed by every
+        # gateway turn, surviving its teardown) keeps a paging path alive.
+        sk = "sess-bg-approver"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            notify, seen = self._resolve_with(approval_mod, sk, "once")
+            # The gateway turn registers both; then the turn ends.
+            approval_mod.register_gateway_notify(sk, notify)
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.unregister_gateway_notify(sk)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert cb("Bash(ls)", "Claude requests tool Bash") == "once"
+                assert len(seen) == 1  # the operator WAS paged
+                assert seen[0]["command"] == "Bash(ls)"
+            finally:
+                approval_mod.unregister_session_notify(sk)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_no_approver_deny_is_not_attributed_to_user(
+        self, monkeypatch, caplog,
+    ):
+        # End to end across the widened channel: bridge (no approver) →
+        # _make_can_use_tool → PermissionResultDeny carrying the honest
+        # reason. "denied by user" is reserved for the plain user-deny path.
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-bg-honest")
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            session, _ = _make_session(
+                approval_callback=cb, permission_mode="default"
+            )
+            fn = session._make_can_use_tool()
+            with caplog.at_level(logging.WARNING, logger="tools.approval"):
+                res = asyncio.run(fn("Bash", {"command": "ls"}, None))
+            assert type(res).__name__ == "PermissionResultDeny"
+            assert res.message == "no approver available (background context)"
+            assert "denied by user" not in res.message
+            assert any(
+                "NO approver available" in r.getMessage()
+                for r in caplog.records
+            )
+
+            # Back-compat: plain string returns keep their classic mapping.
+            session2, _ = _make_session(
+                approval_callback=lambda *a, **k: "deny",
+                permission_mode="default",
+            )
+            res2 = asyncio.run(session2._make_can_use_tool()("Bash", {}, None))
+            assert res2.message == "denied by user"
+            session3, _ = _make_session(
+                approval_callback=lambda *a, **k: "once",
+                permission_mode="default",
+            )
+            res3 = asyncio.run(session3._make_can_use_tool()("Bash", {}, None))
+            assert type(res3).__name__ == "PermissionResultAllow"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_session_scoped_entry_lifecycle(self, monkeypatch):
+        # Leak guard: the entry survives turn teardown (the feature), dies at
+        # the conversation boundary (clear_session — the gateway's boundary
+        # funnel) and at shutdown (clear_all_session_notify); re-register is
+        # idempotent.
+        sk = "sess-lifecycle"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            notify, _ = self._resolve_with(approval_mod, sk, "once")
+            approval_mod.register_gateway_notify(sk, notify)
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.unregister_gateway_notify(sk)
+            assert sk in approval_mod._session_notify_cbs  # survives the turn
+
+            # Idempotent refresh: latest cb wins, still a single entry.
+            def other(_data):
+                pass
+
+            approval_mod.register_session_notify(sk, other)
+            assert approval_mod._session_notify_cbs[sk] is other
+
+            # Conversation boundary removes it; the bridge then denies
+            # honestly instead of paging a rotated-away session.
+            approval_mod.clear_session(sk)
+            assert sk not in approval_mod._session_notify_cbs
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            result = cb("Bash(ls)", "desc")
+            assert result["reason"] == "no approver available (background context)"
+
+            # Unknown-key unregister is a no-op; clear-all empties.
+            approval_mod.unregister_session_notify("never-registered")
+            approval_mod.register_session_notify(sk, notify)
+            approval_mod.clear_all_session_notify()
+            assert approval_mod._session_notify_cbs == {}
+        finally:
+            approval_mod.unregister_session_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_unanswered_and_failed_prompts_carry_honest_reasons(
+        self, monkeypatch,
+    ):
+        # The model must never hear "denied by user" for a prompt no user
+        # answered: timeout, notify-failure and /deny <reason> each carry
+        # their own truth.
+        sk = "sess-honest-reasons"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+
+            # Timeout: the operator was paged but never answered.
+            monkeypatch.setattr(
+                approval_mod, "_get_approval_timeout", lambda: 0.0
+            )
+            paged = []
+            approval_mod.register_session_notify(sk, paged.append)
+            result = cb("Bash(sleep)", "desc")
+            assert result == {
+                "choice": "deny",
+                "reason": "approval timed out — no operator response",
+            }
+            assert len(paged) == 1
+
+            # Notify failure: the prompt never reached the operator.
+            def broken(_data):
+                raise RuntimeError("adapter send failed")
+
+            approval_mod.register_session_notify(sk, broken)
+            result = cb("Bash(x)", "desc")
+            assert result["choice"] == "deny"
+            assert "notify failed" in result["reason"]
+            assert "denied by user" not in result["reason"]
+
+            # /deny <reason>: a REAL user deny — attributed, in their words.
+            # Restore a sane timeout: the 0.0 above would hit the deadline
+            # break before the wait ever observes the (already-set) event.
+            monkeypatch.setattr(
+                approval_mod, "_get_approval_timeout", lambda: 5.0
+            )
+
+            def deny_with_reason(_data):
+                approval_mod.resolve_gateway_approval(
+                    sk, "deny", reason="not now"
+                )
+
+            approval_mod.register_session_notify(sk, deny_with_reason)
+            result = cb("Bash(y)", "desc")
+            assert result == {
+                "choice": "deny", "reason": "denied by user: not now",
+            }
+        finally:
+            approval_mod.unregister_session_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_cron_born_session_approves_in_later_interactive_turn(
+        self, monkeypatch,
+    ):
+        # Sticky-session freeze (incident defect 3): the SDK session and its
+        # approval callback are frozen at creation; a session FIRST created
+        # during a cron turn got callback=None forever — every
+        # un-allowlisted tool silently denied even in later interactive
+        # turns, until a session retire. Per-call resolution: the SAME
+        # callback object denies honestly during cron turns and pages the
+        # operator normally once an interactive turn refreshes the context.
+        from tools import approval as approval_mod
+
+        sk = "sess-cron-born"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        # What the cron turn's per-turn refresh writes into the holder.
+        holder = {"gateway": False, "session_key": ""}
+        cb = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: dict(holder)
+        )
+        # RED pre-fix: the builder returned None for cron contexts, which
+        # is exactly the freeze.
+        assert cb is not None
+
+        # Prompt during the cron turn: immediate honest deny — no paging,
+        # no blocking, posture preserved.
+        result = cb("Bash(ls)", "desc")
+        assert result["reason"] == "no approver available (background context)"
+
+        # Later INTERACTIVE turn on the SAME SDK session: the runtime's
+        # per-turn refresh rewrites the holder; the gateway registers its
+        # turn notify. No session retire happened.
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        holder.update({"gateway": True, "session_key": sk})
+        notify, seen = self._resolve_with(approval_mod, sk, "once")
+        approval_mod.register_gateway_notify(sk, notify)
+        try:
+            # Invoke from a FRESH thread — the SDK loop-thread reality:
+            # contextvars invisible, so the holder must carry the context.
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Bash(uname)", "desc"))
+            )
+            t.start()
+            t.join(timeout=10)
+            assert out.get("r") == "once"
+            assert len(seen) == 1
+            assert seen[0]["command"] == "Bash(uname)"
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+
+    def test_silent_denies_logged_with_tool_and_reason(
+        self, monkeypatch, caplog,
+    ):
+        # P2.d: every deny that transits the SDK lane WITHOUT an operator
+        # tap must be observable — the incident's silent denies had no log
+        # line at all. The choke point is _make_can_use_tool; "denied by
+        # user" is the trustworthy operator-attribution prefix (W8/W11)
+        # and is deliberately NOT logged as silent.
+        SILENT = "silent deny (no operator choice)"
+
+        def _records(cl):
+            return [r for r in cl.records if SILENT in r.getMessage()]
+
+        def _deny_via(callback, cl):
+            session, _ = _make_session(
+                approval_callback=callback, permission_mode="default",
+                hermes_session_id="sess-w13",
+            )
+            with cl.at_level(
+                logging.INFO,
+                logger="agent.transports.claude_agent_sdk_session",
+            ):
+                return asyncio.run(
+                    session._make_can_use_tool()("Bash", {"command": "x"}, None)
+                )
+
+        # Class 1 — no-approver, via the REAL bridge (nothing registered).
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-w13-none")
+        try:
+            caplog.clear()
+            res = _deny_via(
+                approval_mod.build_sdk_gateway_approval_callback(), caplog,
+            )
+            assert res.message == "no approver available (background context)"
+            recs = _records(caplog)
+            assert len(recs) == 1
+            msg = recs[0].getMessage()
+            assert "tool=Bash" in msg
+            assert "no approver available" in msg
+            assert "session=sess-w13" in msg
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        # Classes 2–3 — timeout and teardown-expiry reasons (the real
+        # bridge produces these dicts; the choke point must log them).
+        for reason in (
+            "approval timed out — no operator response",
+            "approval expired (turn ended)",
+        ):
+            caplog.clear()
+            res = _deny_via(
+                lambda *a, **k: {"choice": "deny", "reason": reason}, caplog,
+            )
+            assert res.message == reason
+            recs = _records(caplog)
+            assert len(recs) == 1
+            assert reason in recs[0].getMessage()
+            assert "tool=Bash" in recs[0].getMessage()
+
+        # Class 4 — callback failure.
+        caplog.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("bridge exploded")
+
+        res = _deny_via(_boom, caplog)
+        assert res.message == "approval callback failed"
+        recs = _records(caplog)
+        assert len(recs) == 1
+        assert "approval callback failed" in recs[0].getMessage()
+
+        # Class 5 — the CLI thread-local callback's bare "timeout" string:
+        # previously mapped to "denied by user" (fabricated attribution).
+        caplog.clear()
+        res = _deny_via(lambda *a, **k: "timeout", caplog)
+        assert res.message == "approval timed out — no operator response"
+        assert len(_records(caplog)) == 1
+
+        # NEGATIVES — operator denies are NOT silent: no log line.
+        for operator_deny in (
+            lambda *a, **k: "deny",
+            lambda *a, **k: {"choice": "deny", "reason": "denied by user: not now"},
+        ):
+            caplog.clear()
+            res = _deny_via(operator_deny, caplog)
+            assert res.message.startswith("denied by user")
+            assert _records(caplog) == []
+
+        # Allow path logs nothing either.
+        caplog.clear()
+        res = _deny_via(lambda *a, **k: "once", caplog)
+        assert type(res).__name__ == "PermissionResultAllow"
+        assert _records(caplog) == []
+
+    def test_teardown_resolves_inflight_prompts_as_expired(self, monkeypatch):
+        # Incident defect 2 (observed 08-04 and 08-06): turn teardown
+        # signaled the blocked approval wait with an UNSET result; the
+        # bridge read that as a deny and the model heard "denied by user"
+        # for a prompt nobody answered. Teardown now stamps "expired" and
+        # the SDK lane carries the honest reason.
+        sk = "sess-teardown"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            # Paged but never answered — the prompt is in flight when the
+            # turn tears down.
+            approval_mod.register_gateway_notify(sk, lambda data: None)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            out = {}
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Bash(x)", "desc"))
+            )
+            t.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with approval_mod._lock:
+                    if approval_mod._gateway_queues.get(sk):
+                        break
+                time.sleep(0.01)
+            approval_mod.unregister_gateway_notify(sk)
+            t.join(timeout=10)
+            assert out.get("r") == {
+                "choice": "deny",
+                "reason": "approval expired (turn ended)",
+            }
+            assert "denied by user" not in str(out.get("r"))
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_tool_use_id_threads_from_context_to_approval_data(
+        self, monkeypatch,
+    ):
+        # P2.a end to end: context.tool_use_id → callback kwarg (marker
+        # opt-in) → approval_data → the pending entry the button resolves.
+        approval_mod, token = self._gateway_ctx(monkeypatch, "sess-correlate")
+        try:
+            notify, seen = self._resolve_with(
+                approval_mod, "sess-correlate", "once"
+            )
+            approval_mod.register_gateway_notify("sess-correlate", notify)
+            try:
+                cb = approval_mod.build_sdk_gateway_approval_callback()
+                assert getattr(cb, "_accepts_tool_use_id", False) is True
+                assert cb("Bash(a)", "desc", tool_use_id="toolu_T") == "once"
+                assert seen[0]["tool_use_id"] == "toolu_T"
+            finally:
+                approval_mod.unregister_gateway_notify("sess-correlate")
+
+            # Session layer: a marker-bearing callback receives the SDK
+            # context's id...
+            got = {}
+
+            def marked(command, description, *, allow_permanent=False,
+                       tool_use_id=""):
+                got["tool_use_id"] = tool_use_id
+                return "once"
+
+            marked._accepts_tool_use_id = True
+            session, _ = _make_session(
+                approval_callback=marked, permission_mode="default"
+            )
+            ctx_obj = SimpleNamespace(tool_use_id="toolu_CTX")
+            res = asyncio.run(
+                session._make_can_use_tool()("Bash", {"command": "x"}, ctx_obj)
+            )
+            assert type(res).__name__ == "PermissionResultAllow"
+            assert got["tool_use_id"] == "toolu_CTX"
+
+            # ...and a marker-less (CLI-style) callback keeps its exact
+            # signature — invoked without the kwarg, no TypeError.
+            calls = {}
+
+            def plain(command, description, *, allow_permanent=False):
+                calls["ok"] = True
+                return "deny"
+
+            session2, _ = _make_session(
+                approval_callback=plain, permission_mode="default"
+            )
+            res2 = asyncio.run(
+                session2._make_can_use_tool()("Bash", {}, ctx_obj)
+            )
+            assert calls["ok"] is True
+            assert type(res2).__name__ == "PermissionResultDeny"
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_no_context_deny_is_honest(self, monkeypatch, caplog):
+        # A background prompt on a session whose latest turn context is
+        # empty (no gateway, no key) must deny with the honest reason —
+        # never the "denied by user" lie, never silently.
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        cb = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: {}
+        )
+        assert cb is not None
+        out = {}
+        with caplog.at_level(logging.WARNING, logger="tools.approval"):
+            t = threading.Thread(
+                target=lambda: out.update(r=cb("Read(/x)", "desc"))
+            )
+            t.start()
+            t.join(timeout=10)
+        assert out.get("r") == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert any(
+            "NO approver available" in r.getMessage() for r in caplog.records
+        )
+
+    def test_turn_refreshes_sdk_approval_context_snapshot(self, monkeypatch):
+        # Runtime seam: the holder is rewritten at the TOP of
+        # run_claude_agent_sdk_turn on every call — that per-turn refresh is
+        # what un-freezes a cron-born session.
+        import hermes_cli.config as cfg
+        from tools import approval as approval_mod
+
+        captured = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input, **kw):
+                return _make_turn()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.claude_agent_sdk_session.ClaudeAgentSdkSession",
+            SpySession,
+        )
+        monkeypatch.setattr(
+            cfg, "load_config_readonly", lambda *a, **k: {}, raising=False
+        )
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        token = approval_mod.set_current_session_key("turn-key-1")
+        try:
+            run_claude_agent_sdk_turn(
+                agent, user_message="hi", original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="t",
+            )
+        finally:
+            approval_mod.reset_current_session_key(token)
+        assert agent._sdk_approval_turn_ctx == {
+            "gateway": True, "session_key": "turn-key-1",
+        }
+        assert captured.get("approval_callback") is not None  # bridge wired
+
+        # Second call under a DIFFERENT key: the snapshot is rewritten (the
+        # refresh runs before any session logic; forcing re-creation keeps
+        # the spy simple — the refresh itself is call-scoped, not
+        # creation-scoped).
+        agent._claude_sdk_session = None
+        token = approval_mod.set_current_session_key("turn-key-2")
+        try:
+            run_claude_agent_sdk_turn(
+                agent, user_message="again", original_user_message="again",
+                messages=[{"role": "user", "content": "again"}],
+                effective_task_id="t",
+            )
+        finally:
+            approval_mod.reset_current_session_key(token)
+        assert agent._sdk_approval_turn_ctx == {
+            "gateway": True, "session_key": "turn-key-2",
+        }
 
     def _resolve_with(self, approval_mod, session_key, choice):
         seen = []
@@ -2531,9 +3576,32 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["research done: Tupã wins"]
+        assert got == [["research done: Tupã wins"]]
         # Observability unchanged: the counter still ticks.
         assert session._unsolicited_results == 1
+
+    def test_bg_burst_delivers_all_buffered_assistant_messages(self):
+        # ×5 incident 2026-08-06: five out-of-turn AssistantMessages were
+        # buffered, the terminal ResultMessage carried its own text, and the
+        # intermediate "Research landed…" message was silently discarded —
+        # only the terminal report reached the callback. The full burst must
+        # arrive as an ordered list, result text deduped against the last
+        # buffered entry.
+        got = []
+        session, holder = _make_session(on_unsolicited_result=got.append)
+        try:
+            session.ensure_started()
+            holder["client"].feed(
+                AssistantMessage(
+                    content=[TextBlock("Research landed — writing up.")]
+                ),
+                AssistantMessage(content=[TextBlock("the full report")]),
+                ResultMessage(result="the full report", uuid="burst-1"),
+            )
+            assert self._wait(lambda: got)
+        finally:
+            session.close()
+        assert got == [["Research landed — writing up.", "the full report"]]
 
     def test_falls_back_to_buffered_assistant_text(self):
         # Some CLI results arrive with result=None; the assistant text blocks
@@ -2549,7 +3617,7 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["the long answer body"]
+        assert got == [["the long answer body"]]
 
     def test_result_uuid_deduplicated(self):
         got = []
@@ -2562,7 +3630,7 @@ class TestUnsolicitedDelivery:
             self._wait(lambda: len(got) >= 2, timeout=0.5)
         finally:
             session.close()
-        assert got == ["answer"]
+        assert got == [["answer"]]
 
     def test_subagent_text_excluded_from_buffer(self):
         # parent_tool_use_id set = subagent stream noise — same gate the
@@ -2581,7 +3649,7 @@ class TestUnsolicitedDelivery:
             assert self._wait(lambda: got)
         finally:
             session.close()
-        assert got == ["top-level answer"]
+        assert got == [["top-level answer"]]
 
     def test_no_callback_keeps_drop_semantics(self):
         # Without a wired callback the historical WARN+counter drop stands
@@ -2599,8 +3667,9 @@ class TestUnsolicitedDelivery:
 
 
 class TestBackgroundDeliveryWiring:
-    """Runtime glue: the session's delivery callback feeds the gateway's
-    existing async-delegation completion pipeline, config-gated."""
+    """Runtime glue: the session's delivery callback enqueues an
+    sdk_background_result event for the gateway watcher's direct outbound
+    send, config-gated."""
 
     def _spy_kwargs(self, monkeypatch):
         import agent.claude_sdk_runtime as runtime_mod
@@ -2658,15 +3727,85 @@ class TestBackgroundDeliveryWiring:
         )
         callback = captured.get("on_unsolicited_result")
         assert callback is not None, "flag defaults ON — callback must be wired"
-        callback("background answer text")
+        callback(["Research landed — writing up.", "background answer text"])
         assert len(events) == 1
         evt = events[0]
-        assert evt["type"] == "async_delegation"
-        assert evt["status"] == "completed"
-        assert evt["summary"] == "background answer text"
+        # Direct-outbound event: the payload burst rides UNJOINED (each text
+        # becomes its own outbound message) and no model-facing directive is
+        # prepended — on a direct send it would leak to the user.
+        assert evt["type"] == "sdk_background_result"
+        assert evt["payloads"] == [
+            "Research landed — writing up.", "background answer text",
+        ]
+        assert not any("[USER IS WAITING" in p for p in evt["payloads"])
         assert evt["session_key"] == "gw-key-7"
         assert evt["parent_session_id"] == "sess-bg-1"
-        assert evt["delegation_id"] == ""
+        assert "delegation_id" not in evt
+
+    def test_bg_parent_resolved_at_delivery_time_after_rotation(
+        self, monkeypatch,
+    ):
+        # P0.g: the SDK session outlives hermes session rotations. The old
+        # code snapshotted parent_session_id/session_key at SDK-session
+        # CREATION, so a completion firing after rotation carried the dead
+        # parent — the gateway classified it permanently gone and dropped
+        # it. The callback must resolve the parent AT DELIVERY TIME, with
+        # the creation-time snapshot only as a fallback for the SDK-loop
+        # thread where the session-key contextvar is unset.
+        import hermes_cli.config as cfg
+        from tools.process_registry import process_registry
+
+        captured = self._spy_kwargs(monkeypatch)
+        events = []
+
+        class _FakeQueue:
+            def put(self, evt):
+                events.append(evt)
+
+        monkeypatch.setattr(process_registry, "completion_queue", _FakeQueue())
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: "gw-key-7"
+        )
+        monkeypatch.delenv("HERMES_CLAUDE_SDK_DELIVER_BACKGROUND", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"deliver_background_results": True}}
+            },
+            raising=False,
+        )
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent.session_id = "sess-before"
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="t",
+        )
+        callback = captured.get("on_unsolicited_result")
+        assert callback is not None
+
+        # Hermes rotates the session between turns; the completion fires on
+        # the SDK loop thread where the contextvar reads empty.
+        agent.session_id = "sess-after-rotation"
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: ""
+        )
+        callback(["late background report"])
+        assert len(events) == 1
+        assert events[0]["parent_session_id"] == "sess-after-rotation"
+        # Empty live key -> creation-time snapshot fallback keeps the route.
+        assert events[0]["session_key"] == "gw-key-7"
+
+        # A live, non-empty contextvar read wins over the snapshot.
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key", lambda: "gw-key-LIVE"
+        )
+        callback(["second late report"])
+        assert len(events) == 2
+        assert events[1]["session_key"] == "gw-key-LIVE"
+        assert events[1]["parent_session_id"] == "sess-after-rotation"
 
     def test_flag_off_leaves_callback_unwired(self, monkeypatch):
         import hermes_cli.config as cfg

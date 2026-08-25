@@ -75,6 +75,17 @@ _SEARCH_QUERY_ADDENDUM = (
     "Prefer one or two distinctive words; join alternatives with OR."
 )
 
+# The claude_code preset ships its own built-in Skill tool, which on this
+# runtime resolves the Claude-Code-bundled catalog — NOT Hermes' skill
+# library, so a genuine Hermes skill comes back "Unknown skill". Hermes
+# skills are only reachable through the hermes-tools shims.
+_SKILL_CATALOG_STEERING = (
+    "Hermes skills are served by the hermes-tools MCP server: discover them "
+    "with skills_list and load one with skill_view(name=...). Do NOT use the "
+    "built-in Skill tool for Hermes skills — on this runtime it resolves a "
+    "different, smaller catalog and will report them as unknown."
+)
+
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
     return (
@@ -223,6 +234,8 @@ def build_system_prompt_append(
         blocks.append(SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM)
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
+
+    blocks.append(_SKILL_CATALOG_STEERING)
 
     # Skills index for the read-side tools, filtered to the honest
     # MCP-exposed surface. `memory` joins only when the shim is actually
@@ -432,6 +445,17 @@ def _render_continuity_digest(prior_messages: List[Dict[str, Any]]) -> str:
     """Bounded text preamble for a FRESH SDK session that has prior Hermes
     history (resume impossible: no stored id, or the stored one went stale).
     Reuses _digest_history's compaction, then flattens to capped text."""
+    # Projected background results are the agent's OWN answers, already
+    # delivered outbound; re-presenting them here is the double-presentation
+    # pathology the background lane exists to kill. Filter before the
+    # compaction pass — _digest_history may rebuild dicts and drop the mark.
+    prior_messages = [
+        m for m in (prior_messages or [])
+        if not (
+            isinstance(m, dict)
+            and m.get("display_kind") == "sdk_background_result"
+        )
+    ]
     try:
         from agent.background_review import _digest_history
 
@@ -523,6 +547,20 @@ def run_claude_agent_sdk_turn(
     """
     from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
 
+    # P1.b: refresh the approval-context snapshot EVERY turn (including
+    # session-reuse turns). This runs on the agent turn thread, where the
+    # session contextvars are visible; the SDK invokes the approval callback
+    # from its own loop thread, where they never are — the callback reads
+    # this holder instead. A cron turn writes gateway=False (honest deny, no
+    # block); a later interactive turn on the SAME SDK session rewrites it
+    # and un-freezes the cron-born session.
+    try:
+        from tools.approval import current_approval_turn_context
+
+        agent._sdk_approval_turn_ctx = current_approval_turn_context()
+    except Exception:
+        logger.debug("approval turn-context refresh failed", exc_info=True)
+
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
@@ -537,12 +575,18 @@ def run_claude_agent_sdk_turn(
             # bridge the SDK denies every un-allowlisted tool silently, no
             # prompt reaching the user, even though the gateway registers a
             # notify channel around every turn (production finding on a 24/7
-            # telegram deployment). The builder returns None outside
-            # interactive gateway sessions, so CLI and cron postures are
-            # unchanged.
+            # telegram deployment). The builder returns None for surfaces
+            # that are not gateway-shaped, so CLI posture is unchanged; the
+            # context_provider hands it the per-turn snapshot refreshed
+            # above, so cron-ness and the session key are resolved per CALL
+            # (a cron-born session must not be frozen into forever-deny).
             try:
                 from tools.approval import build_sdk_gateway_approval_callback
-                approval_callback = build_sdk_gateway_approval_callback()
+                approval_callback = build_sdk_gateway_approval_callback(
+                    context_provider=lambda: (
+                        getattr(agent, "_sdk_approval_turn_ctx", None) or {}
+                    ),
+                )
             except Exception:
                 approval_callback = None
 
@@ -576,18 +620,21 @@ def run_claude_agent_sdk_turn(
 
         # Delivery half of the stream-ownership fix: when the CLI finishes a
         # background Agent task between turns, the session captures the
-        # answer and this callback feeds the gateway's EXISTING
-        # async-delegation completion pipeline (completion_queue →
-        # _async_delegation_watcher → synthetic internal turn → platform
-        # send). Empty delegation_id deliberately skips the durable-claim
-        # branch — v1 is in-memory at-least-once, same as the watcher's
-        # requeue semantics. Config-gated, default OFF per the block's
-        # upstream-conservative contract (every default falsy — pinned by
-        # test_canonical_defaults); gateway-bot deployments opt in.
+        # answer burst and this callback enqueues it as an
+        # "sdk_background_result" completion event; the gateway watcher sends
+        # it DIRECTLY on the platform outbound lane (completion_queue →
+        # _async_delegation_watcher → adapter send). In-memory at-least-once,
+        # same as the watcher's requeue semantics. Config-gated, default OFF
+        # per the block's upstream-conservative contract (every default falsy
+        # — pinned by test_canonical_defaults); gateway-bot deployments opt
+        # in.
         on_unsolicited_result = None
         from agent.transports.claude_agent_sdk_session import _provider_flag
 
         if _provider_flag("deliver_background_results", default=False):
+            # Creation-time snapshots survive as FALLBACKS only — the SDK
+            # session outlives hermes session rotations, so anything read
+            # here can be stale by the time a background completion fires.
             try:
                 from tools.approval import get_current_session_key
 
@@ -597,7 +644,36 @@ def run_claude_agent_sdk_turn(
             _bg_parent_session_id = getattr(agent, "session_id", None)
             _bg_model = getattr(agent, "model", None)
 
-            def _deliver_background_result(text: str) -> None:
+            def _deliver_background_result(texts: list[str]) -> None:
+                # The completion is the AGENT'S OWN finished answer — it must
+                # go straight to the platform outbound lane, never back into
+                # the model as a synthetic delegation (2026-08-06 self-echo:
+                # the model recognized its own text, refused to "relay" it,
+                # and the report never left the box). The watcher delivers
+                # each payload as its own outbound message, in order.
+                #
+                # Parent/route are resolved AT DELIVERY TIME: a completion
+                # firing after a hermes session rotation must carry the LIVE
+                # session id, not the creation-time snapshot — the gateway
+                # classifies a rotated-away parent as permanently gone and
+                # drops the delivery.
+                try:
+                    from tools.approval import (
+                        get_current_session_key as _live_key_fn,
+                    )
+
+                    _live_key = _live_key_fn() or ""
+                except Exception:
+                    _live_key = ""
+                # This callback fires on the SDK loop thread, where the
+                # get_current_session_key contextvar may be unset — an empty
+                # live read falls back to the creation-time snapshot rather
+                # than losing the route.
+                session_key = _live_key or _bg_session_key
+                parent_session_id = (
+                    getattr(agent, "session_id", None) or _bg_parent_session_id
+                )
+                model = getattr(agent, "model", None) or _bg_model
                 try:
                     import time as _time
 
@@ -605,25 +681,13 @@ def run_claude_agent_sdk_turn(
 
                     now = _time.time()
                     process_registry.completion_queue.put({
-                        "type": "async_delegation",
-                        "delegation_id": "",
-                        "session_key": _bg_session_key,
-                        "origin_ui_session_id": "",
-                        "origin_session_id": "",
-                        "parent_session_id": _bg_parent_session_id,
-                        "goal": "background Agent task (claude-agent-sdk)",
-                        "context": None,
-                        "toolsets": None,
-                        "role": None,
-                        "model": _bg_model,
-                        "status": "completed",
-                        "summary": text,
-                        "error": None,
-                        "api_calls": 0,
-                        "duration_seconds": 0.0,
+                        "type": "sdk_background_result",
+                        "payloads": list(texts),
+                        "session_key": session_key,
+                        "parent_session_id": parent_session_id,
+                        "model": model,
                         "dispatched_at": now,
                         "completed_at": now,
-                        "exit_reason": None,
                     })
                 except Exception:
                     logger.warning(

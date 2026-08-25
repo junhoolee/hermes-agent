@@ -71,6 +71,12 @@ from hermes_cli.fallback_config import get_fallback_chain
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
 # memory providers, etc.).  LRU order + idle TTL eviction are enforced
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
+#
+# These are the defaults; `agent.agent_cache.max_size` /
+# `agent.agent_cache.idle_ttl_secs` in config.yaml override them per
+# deployment.  Neither bound knows how many BYTES a cached agent holds, so
+# _sweep_agent_cache_under_pressure() adds the missing memory-pressure valve
+# (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
@@ -1220,6 +1226,14 @@ def _build_replay_entry(
             elif not _rval:
                 continue
             entry[_rkey] = _rval
+        # Row-marker carry: a projected background result
+        # (display_kind="sdk_background_result") must stay identifiable
+        # through this rebuild or the continuity digest cannot exclude it —
+        # re-presenting the agent's own delivered answer is the exact
+        # double-presentation pathology the SDK background lane fixes.
+        # Providers never see the field (the api_messages build strips it).
+        if msg.get("display_kind"):
+            entry["display_kind"] = msg["display_kind"]
     if preserve_timestamp:
         ts = msg.get("timestamp")
         if ts:
@@ -2029,6 +2043,15 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
+# This env var is internal bridge plumbing, not a user-facing configuration
+# source. Initialize it from the canonical config default after dotenv loading
+# so an ambient process/.env value can never control lease safety on its own.
+from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+
+os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
+    _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
+)
+
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
@@ -2067,6 +2090,7 @@ if _config_path.exists():
             ).strip().lower()
             _terminal_env_map = {
                 "backend": "TERMINAL_ENV",
+                "degraded_mode": "TERMINAL_DEGRADED_MODE",
                 "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
                 "home_mode": "TERMINAL_HOME_MODE",
@@ -2173,6 +2197,10 @@ if _config_path.exists():
                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
             if "gateway_timeout" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
+            if "gateway_turn_lease_timeout" in _agent_cfg:
+                os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
+                    _agent_cfg["gateway_turn_lease_timeout"]
+                )
             if "gateway_timeout_warning" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
@@ -2366,7 +2394,11 @@ from gateway.delivery import (
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
 )
-from gateway.turn_lease import SessionTurnLeaseRegistry
+from gateway.turn_lease import (
+    DEFAULT_LEASE_WAIT,
+    SessionTurnLeaseRegistry,
+    TurnLeaseTimeoutError,
+)
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
     SessionState,
@@ -3427,7 +3459,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "sdk_background_result"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -5142,6 +5174,7 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            register_session_notify,
             reset_current_session_key,
             set_current_session_key,
             unregister_gateway_notify,
@@ -5180,6 +5213,22 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    # P2.a: hand the SDK prompt correlator to adapters that
+                    # can carry it on the card (signature-guarded — only the
+                    # Telegram adapter accepts it today; the other adapters'
+                    # signatures must not break on an unexpected kwarg).
+                    _sea_extra: Dict[str, Any] = {}
+                    _tuid = approval_data.get("tool_use_id") or ""
+                    if _tuid:
+                        try:
+                            import inspect as _inspect
+
+                            if "tool_use_id" in _inspect.signature(
+                                type(ctx._status_adapter).send_exec_approval
+                            ).parameters:
+                                _sea_extra["tool_use_id"] = _tuid
+                        except (TypeError, ValueError):
+                            pass
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
@@ -5190,6 +5239,7 @@ class TurnRunner:
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
+                            **_sea_extra,
                         ),
                         ctx._loop_for_step,
                         logger=logger,
@@ -5384,6 +5434,13 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        # Session-scoped refresh: unlike the turn registration above, this
+        # entry SURVIVES the finally-unregister, so a CLI-initiated
+        # background SDK turn between hermes turns can still page the
+        # operator (the closure is session-stable: adapter, chat id and
+        # loop all outlive the turn). Removed at conversation boundaries
+        # (clear_session via the boundary funnel) and gateway shutdown.
+        register_session_notify(_approval_session_key, _approval_notify_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -7237,6 +7294,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # it: the caller sees CancelledError, the handler runs to completion.
         await asyncio.shield(task)
 
+    def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
+        """Queue a retryable fatal adapter for background reconnection.
+
+        Returns True when the platform was newly queued. Idempotent if already
+        queued. Must not await: callers invoke this *before* any disconnect
+        await so a wedged close cannot strand the platform (#80598).
+        """
+        if not adapter.fatal_error_retryable:
+            return False
+        platform_config = self.config.platforms.get(adapter.platform)
+        if not platform_config or adapter.platform in self._failed_platforms:
+            return False
+        self._failed_platforms[adapter.platform] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic(),
+            "credential_claim": self._adapter_credential_claim(
+                adapter.platform, adapter
+            ),
+            "listener_claim": self._adapter_listener_claim(
+                adapter.platform, adapter
+            ),
+        }
+        logger.info(
+            "%s queued for background reconnection",
+            adapter.platform.value,
+        )
+        # Ensure the reconnect watcher is alive — if it died (e.g. from
+        # exhausting its restart budget), respawn it so queued platforms
+        # are not permanently stranded (#70344).
+        self._ensure_reconnect_watcher_running()
+        return True
+
     async def _handle_adapter_fatal_error_detached(
         self, adapter: BasePlatformAdapter
     ) -> None:
@@ -7245,12 +7335,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         gateway with failure so the service manager restarts it instead of
         leaving a silent partial outage."""
         try:
-            await self._handle_adapter_fatal_error_impl(adapter)
+            # Outer hard deadline (#80598): even with queue-before-disconnect,
+            # a hang anywhere in the impl (status write side effects, detach
+            # races, etc.) must not leave this task wedged forever — the
+            # stranded check in ``finally`` only runs when we return.
+            timeout = self._adapter_disconnect_timeout_secs()
+            if timeout <= 0:
+                await self._handle_adapter_fatal_error_impl(adapter)
+            else:
+                # Disconnect budget plus a small overhead for queue/status
+                # bookkeeping. Keep the additive proportional so tests that
+                # shrink the disconnect timeout still finish promptly.
+                outer = timeout + min(2.0, max(0.05, timeout))
+                completed = await self._await_adapter_cleanup_with_timeout(
+                    self._handle_adapter_fatal_error_impl(adapter),
+                    outer,
+                )
+                if not completed:
+                    logger.error(
+                        "Fatal-error handling for %s timed out after %.1fs; "
+                        "ensuring reconnect queue is populated",
+                        adapter.platform.value,
+                        outer,
+                    )
+                    self._queue_retryable_fatal_platform(adapter)
+        except asyncio.CancelledError:
+            # Best-effort queue before re-raising: a cancelled fatal handler
+            # must not strand a retryable platform (#80598).
+            try:
+                self._queue_retryable_fatal_platform(adapter)
+            except Exception:
+                logger.debug(
+                    "Failed to queue %s after fatal-handler cancellation",
+                    adapter.platform.value,
+                    exc_info=True,
+                )
+            raise
         except Exception:
             logger.exception(
                 "Fatal-error handling for %s raised unexpectedly",
                 adapter.platform.value,
             )
+            # Best-effort queue so an unexpected raise mid-handler cannot
+            # leave a retryable platform permanently deaf (#80598).
+            try:
+                self._queue_retryable_fatal_platform(adapter)
+            except Exception:
+                logger.debug(
+                    "Failed to queue %s after fatal-handler exception",
+                    adapter.platform.value,
+                    exc_info=True,
+                )
         finally:
             platform = adapter.platform
             shutdown_event = getattr(self, "_shutdown_event", None)
@@ -7321,28 +7456,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the same object twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
+
+        # Queue retryable failures BEFORE any disconnect await (#80598).
+        # A half-dead transport can wedge native close() (or swallow
+        # CancelledError inside it) so the previous "disconnect then queue"
+        # order left platforms permanently deaf inside a live process even
+        # after the network recovered. Populate the queue first so the
+        # reconnect watcher always has work; teardown is best-effort after.
+        self._queue_retryable_fatal_platform(adapter)
+
+        if existing is adapter:
             # A half-closed transport can wedge an adapter's native close()
             # indefinitely. Reuse the shutdown-path timeout so this runtime
-            # fatal handler always reaches the reconnect queue.
+            # fatal handler always returns to the stay-alive / stranded path.
             await self._safe_adapter_disconnect(adapter, adapter.platform)
-
-        # Queue retryable failures for background reconnection
-        if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic(),
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
-                # Ensure the reconnect watcher is alive — if it died (e.g. from
-                # exhausting its restart budget), respawn it so queued platforms
-                # are not permanently stranded (#70344).
-                self._ensure_reconnect_watcher_running()
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
@@ -7418,6 +7545,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
         except Exception:
+            return 0
+
+    def _interrupt_api_server_runs(self, reason: str) -> int:
+        """Interrupt API-server agents that are not in ``_running_agents``.
+
+        Counterpart of ``_active_api_run_count()``: that method folds
+        adapter-owned API work into the shutdown drain, so this one must reach
+        the same agents when the drain times out. Duck-typed on the adapter so
+        an older adapter (or a minimal test double for this class) without the
+        hook is simply skipped rather than raising mid-shutdown.
+        """
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            helper = getattr(adapter, "interrupt_active_runs", None)
+            return max(0, int(helper(reason))) if callable(helper) else 0
+        except Exception as exc:
+            logger.debug("Failed interrupting api_server runs during shutdown: %s", exc)
             return 0
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
@@ -9249,6 +9393,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
+        # API-server / desk turns are adapter-owned and never enter
+        # _running_agents, so the loop above cannot see them even though
+        # _drain_active_agents() waited for them (#63529).
+        interrupted_api = self._interrupt_api_server_runs(reason)
+        if interrupted_api:
+            logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
@@ -12070,6 +12220,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("Idle agent sweep failed: %s", _e)
 
+                # Neither the LRU cap nor the idle TTL is aware of how much
+                # memory a cached transcript costs, so a busy gateway keeps
+                # every warm session's tool output resident until RSS hits the
+                # cgroup limit (#80764). Shed LRU transcripts once the heap is
+                # over budget; they reload from the persisted session on the
+                # next turn.
+                try:
+                    self._sweep_agent_cache_under_pressure()
+                except Exception as _e:
+                    logger.debug("Agent cache pressure sweep failed: %s", _e)
+
                 # Periodically prune stale SessionStore entries.  The
                 # in-memory dict (and sessions.json) would otherwise grow
                 # unbounded in gateways serving many rotating chats /
@@ -12916,9 +13077,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
-                while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
+                # Wait on API-server work too. The interrupt is cooperative:
+                # without this the settle window closes the instant
+                # _running_agents is empty, and an API turn that was just asked
+                # to stop gets its tool subprocesses killed below before it can
+                # unwind — the exact amputation this interrupt exists to avoid.
+                while (
+                    self._running_agents or self._active_api_run_count()
+                ) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
+
+                # The interrupt above fires exactly once, but work can
+                # materialize AFTER that one shot: a /v1/runs task admitted
+                # before the drain populates _active_run_agents only once
+                # _create_agent returns, and a _running_agents entry claimed
+                # as _AGENT_PENDING_SENTINEL is promoted to a real agent by
+                # track_agent() on its own schedule. Either way the settle
+                # loop waited on work nothing signaled. If any is still live
+                # at settle-loop exit, re-signal so a late-materializing
+                # agent gets a cooperative interrupt instead of going
+                # straight to the tool-subprocess kill.
+                if self._running_agents or self._active_api_run_count():
+                    self._interrupt_running_agents(
+                        _INTERRUPT_REASON_GATEWAY_RESTART
+                        if self._restart_requested
+                        else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
+                    )
+                    logger.debug(
+                        "Re-signaled interrupt for work still live at settle-window exit"
+                    )
 
                 # Kill lingering tool subprocesses NOW, before we spend more
                 # budget on adapter disconnect / session DB close.  Under
@@ -12963,6 +13151,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            # Session-scoped approval notify callbacks close over adapters
+            # and the loop being torn down below — a retained entry would
+            # page dead sessions on the next start-in-process (restart).
+            try:
+                from tools.approval import clear_all_session_notify
+
+                clear_all_session_notify()
+            except Exception:
+                logger.debug(
+                    "clear_all_session_notify failed during shutdown",
+                    exc_info=True,
+                )
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -14509,7 +14710,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # Global emergency stop (`hermes pause`): give new turns a brief
+        # paused notice instead of starting an agent run. Internal events
+        # (background-process completions from IN-FLIGHT work) bypass the
+        # gate — pause stops NEW work, it never kills or orphans running
+        # work. Placed after auth so unauthorized senders keep the normal
+        # silent/pairing behavior and can't probe pause state.
+        if not is_internal:
+            try:
+                from agent.estop import paused_reply as _estop_paused_reply
+                _paused_notice = _estop_paused_reply()
+            except ImportError:
+                _paused_notice = None
+            if _paused_notice is not None:
+                logger.info(
+                    "Gateway turn paused by global emergency stop (platform=%s chat=%s)",
+                    getattr(getattr(source, "platform", None), "value", "unknown"),
+                    getattr(source, "chat_id", None) or "unknown",
+                )
+                return _paused_notice
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -15688,7 +15909,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            try:
+                _agent_result = await self._handle_message_with_agent(
+                    event, source, _quick_key, _run_generation
+                )
+            except TurnLeaseTimeoutError as exc:
+                # This is a rejected message, not a completed agent turn. Return
+                # before the /goal judge below so it cannot consume the resend
+                # notice and enqueue a synthetic continuation loop.
+                logger.error(
+                    "Rejecting turn for routing key %s on session %s after "
+                    "turn-lease timeout; transcript load was not started and "
+                    "the user must resend",
+                    _quick_key,
+                    exc.session_id,
+                )
+                return (
+                    "⏳ Another turn is still running on this session. To "
+                    "protect the transcript, this message was not processed. "
+                    "Wait for the active turn to finish, then resend it."
+                )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -16574,19 +16814,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stale history base and interleaving transcript writes. Same-key
         # messages never reach this point mid-turn (adapter + runner guards
         # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-open: on timeout the token comes back degraded and the turn
-        # proceeds unserialized (never a wedged session). Released in
-        # _handle_message's finally via _release_turn_lease — granted per
-        # (routing key, run generation) so a stale unwind can't release a
-        # newer turn's lease.
+        # Fail-closed on timeout: never enter the transcript region without a
+        # lease. Outer dispatch returns a bounded rejection/resend notice rather
+        # than recreating the exact concurrent-turn corruption this lease exists
+        # to prevent. Released in _handle_message's finally via
+        # _release_turn_lease — granted per (routing key, run generation) so a
+        # stale unwind can't release a newer turn's lease.
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is not None:
-            _lease_token = await _lease_registry.acquire(
-                session_entry.session_id,
-                owner_key=_quick_key,
-                generation=run_generation,
-                timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
-            )
+            try:
+                _lease_token = await _lease_registry.acquire(
+                    session_entry.session_id,
+                    owner_key=_quick_key,
+                    generation=run_generation,
+                    timeout=_float_env(
+                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                    ),
+                )
+            except TurnLeaseTimeoutError:
+                # The broad session-context cleanup finally starts later in this
+                # method. Restore the tokens here before propagating the rejection
+                # to outer dispatch, or this early exit leaks task-local identity.
+                self._clear_session_env(_session_env_tokens)
+                raise
             if _lease_token is not None:
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
@@ -22093,6 +22343,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    _SELF_ECHO_TAIL_ROWS = 30
+
+    async def _self_echo_guard_redirect(self, evt: dict) -> bool:
+        """Belt-and-braces for the surviving re-injection lane.
+
+        The direct sdk_background_result lane cannot echo by construction;
+        genuine delegations still deliver by injecting a synthetic turn into
+        the parent session — a payload identical to that session's own
+        recent assistant text would recreate the 2026-08-06 self-echo (the
+        model recognizes its own words and refuses to relay them).
+
+        Returns True when the completion's raw payload matched the parent
+        session's recent assistant tail and was redirected to the direct
+        outbound lane instead — that redirect IS delivery, so the caller's
+        acceptance bookkeeping (durable claim completed, never released)
+        must run exactly as for an accepted injection. Returns False to
+        inject normally; fails OPEN on any read error — this is a guard,
+        not a delivery gate.
+        """
+        if evt.get("type") != "async_delegation":
+            return False
+        summary = evt.get("summary")
+        parent = str(evt.get("parent_session_id") or "").strip()
+        if not isinstance(summary, str) or not summary.strip() or not parent:
+            return False
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return False
+
+        def _norm(text: str) -> str:
+            return " ".join(text.split())
+
+        try:
+            session = await db.get_session(parent)
+            if not session:
+                return False
+            count = int(session.get("message_count") or 0)
+            rows = await db.get_messages(
+                parent,
+                limit=self._SELF_ECHO_TAIL_ROWS,
+                offset=max(0, count - self._SELF_ECHO_TAIL_ROWS),
+            )
+            target = _norm(summary)
+            matched = any(
+                row.get("role") == "assistant"
+                and isinstance(row.get("content"), str)
+                and _norm(row["content"]) == target
+                for row in rows or []
+            )
+        except Exception:
+            logger.debug(
+                "self-echo guard read failed for session %s — failing open "
+                "to normal injection", parent, exc_info=True,
+            )
+            return False
+        if not matched:
+            return False
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put({
+                "type": "sdk_background_result",
+                "payloads": [summary],
+                "session_key": str(evt.get("session_key") or ""),
+                "parent_session_id": parent,
+                "model": evt.get("model"),
+                "dispatched_at": evt.get("dispatched_at"),
+                "completed_at": evt.get("completed_at"),
+                # The payload IS the session's own recent assistant text —
+                # it already lives in the transcript; re-projecting would
+                # write a duplicate row.
+                "_projected": True,
+            })
+        except Exception:
+            logger.warning(
+                "self-echo guard matched delegation %s but redirect enqueue "
+                "failed — falling back to normal injection",
+                evt.get("delegation_id"), exc_info=True,
+            )
+            return False
+        logger.warning(
+            "self-echo guard: delegation %s payload is identical to recent "
+            "assistant text of session %s — injection skipped, payload "
+            "redirected to the direct outbound lane",
+            evt.get("delegation_id"), parent,
+        )
+        return True
+
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -22140,6 +22478,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "delegation records).",
                         durable_delegation_id or "<legacy>", parent_session_id,
                     )
+                    # The drop is deliberate — a rotated-away session can be
+                    # a deliberate user statement (/new), so no auto-send to
+                    # a last-known route — but the PAYLOAD itself must
+                    # survive: for legacy/id-less events the queue copy was
+                    # the ONLY copy. Project it into the transcript when the
+                    # db can take it, else write an orphaned-results file.
+                    _summary = evt.get("summary")
+                    if isinstance(_summary, str) and _summary.strip():
+                        _projected_terminal = False
+                        _db = getattr(self, "_session_db", None)
+                        if _db is not None:
+                            try:
+                                await _db.append_message(
+                                    session_id=parent_session_id,
+                                    role="assistant",
+                                    content=_summary,
+                                    display_kind="sdk_background_result",
+                                    display_metadata={
+                                        "orphaned": "terminal_drop",
+                                        "delegation_id":
+                                            durable_delegation_id or None,
+                                        "completed_at": evt.get("completed_at"),
+                                    },
+                                )
+                                _projected_terminal = True
+                            except Exception:
+                                logger.debug(
+                                    "terminal-drop transcript projection "
+                                    "failed for %s", parent_session_id,
+                                    exc_info=True,
+                                )
+                        if not _projected_terminal:
+                            self._persist_orphaned_result_file(
+                                [_summary],
+                                session_id=parent_session_id,
+                                reason="terminal_drop",
+                            )
                     if durable_claim_id:
                         try:
                             from tools.async_delegation import drop_completion_delivery
@@ -22178,9 +22553,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
-                return injection_result
+            if await self._self_echo_guard_redirect(evt):
+                # Redirected to the direct outbound lane — this IS delivery;
+                # flow through the same acceptance tail so the durable claim
+                # is completed, never released as a failure.
+                pass
+            else:
+                injection_result = await self._inject_watch_notification(synth_text, evt)
+                if injection_result is not True:
+                    return injection_result
             accepted = True
 
             if identity is not None:
@@ -22244,6 +22625,287 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    def _persist_orphaned_result_file(
+        self, payloads: list, *, session_id: Optional[str], reason: str,
+    ) -> Optional[str]:
+        """Last-resort durability for a finished background/delegation payload
+        that can reach neither its transcript nor its recipient (terminal
+        parent drop, projection failure). Writes the payload to
+        ``~/.hermes/orphaned-results/`` so a gateway restart or a terminal
+        drop can never erase the only copy — "nothing finished may ever
+        become unrecoverable again". Returns the file path, or None on
+        failure; never raises (persistence trouble must not block the drop
+        disposition or the delivery attempt).
+        """
+        try:
+            import uuid as _uuid
+
+            out_dir = get_hermes_home() / "orphaned-results"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            safe_session = re.sub(
+                r"[^A-Za-z0-9._-]", "_", str(session_id or "unknown"),
+            )[:80]
+            path = out_dir / (
+                f"{stamp}-{safe_session}-{_uuid.uuid4().hex[:8]}.json"
+            )
+            path.write_text(
+                json.dumps({
+                    "persisted_at": time.time(),
+                    "session_id": session_id,
+                    "reason": reason,
+                    "payloads": [str(p) for p in payloads],
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.warning(
+                "orphaned result persisted to %s (%s, %d payload(s))",
+                path, reason, len(payloads),
+            )
+            return str(path)
+        except Exception:
+            logger.warning(
+                "orphaned-result file persistence failed (%s) — payload "
+                "remains at risk", reason, exc_info=True,
+            )
+            return None
+
+    async def _deliver_sdk_background_result(self, evt: dict) -> Optional[bool]:
+        """Send a finished claude-agent-sdk background result DIRECTLY on the
+        platform outbound lane — never re-injected into the agent session.
+
+        The old lane wrapped the agent's own answer in a synthetic empty-id
+        delegation and asked the model to relay it; the model recognized its
+        own text, refused, and the answer never left the box (2026-08-06).
+        Each payload goes out as its own agent message, in order.
+
+        ``True`` = every payload sent. ``False`` = retry (caller requeues;
+        already-sent payloads are trimmed off the event first, so the retry
+        delivers only the remainder). ``None`` = empty event, nothing to send.
+        A missing route fails SAFE with ``False`` — the payload is a finished
+        result the user is waiting on; it must never be dropped silently.
+
+        Durability contract: every payload is projected into the hermes
+        transcript BEFORE any routing or send (save the text first — the
+        2026-08-06 report was FTS-invisible and one session retire away from
+        unrecoverable), marked ``display_kind="sdk_background_result"`` so
+        the continuity digest never re-presents the agent's own delivered
+        answer, and each send is registered as a delivery-ledger obligation.
+        Projection and ledger trouble never block the send.
+        """
+        payloads = [
+            p for p in (evt.get("payloads") or [])
+            if isinstance(p, str) and p.strip()
+        ]
+        if not payloads:
+            logger.warning(
+                "sdk_background_result event carried no payloads — dropping",
+            )
+            return None
+        if not evt.get("_projected"):
+            # Once per event lifetime — a requeued retry (trimmed or
+            # unroutable) must not write duplicate transcript rows.
+            evt["_projected"] = True
+            _db = getattr(self, "_session_db", None)
+            _parent = str(evt.get("parent_session_id") or "").strip()
+            if _db is None or not _parent:
+                logger.warning(
+                    "sdk_background_result not projected into transcript "
+                    "(session_db=%s, parent_session_id=%r) — persisting to "
+                    "orphaned-results",
+                    "ok" if _db is not None else None, _parent,
+                )
+                # Queue-only payloads die with a gateway restart — give them
+                # a durable copy before the delivery attempt.
+                self._persist_orphaned_result_file(
+                    payloads,
+                    session_id=_parent or None,
+                    reason="projection_unavailable",
+                )
+            else:
+                _unprojected = []
+                for _payload in payloads:
+                    try:
+                        await _db.append_message(
+                            session_id=_parent,
+                            role="assistant",
+                            content=_payload,
+                            display_kind="sdk_background_result",
+                            display_metadata={
+                                "completed_at": evt.get("completed_at"),
+                            },
+                        )
+                    except Exception:
+                        _unprojected.append(_payload)
+                        logger.warning(
+                            "sdk_background_result transcript projection "
+                            "failed for session %s — continuing with "
+                            "delivery", _parent, exc_info=True,
+                        )
+                if _unprojected:
+                    self._persist_orphaned_result_file(
+                        _unprojected,
+                        session_id=_parent,
+                        reason="projection_failed",
+                    )
+        source = self._build_process_event_source(evt)
+        adapter = None
+        if source is not None:
+            platform_name = (
+                source.platform.value
+                if hasattr(source.platform, "value")
+                else str(source.platform)
+            )
+            for p, a in self.adapters.items():
+                if p.value == platform_name:
+                    adapter = a
+                    break
+        from gateway.wake import adapter_supports_push
+        if source is None or adapter is None or not adapter_supports_push(adapter):
+            # Non-push adapters (api_server) deliver by running a wake turn —
+            # re-injection, the exact mechanism this lane exists to avoid, so
+            # they have no deliverable route here either.
+            if not evt.get("_route_warned"):
+                evt["_route_warned"] = True
+                logger.warning(
+                    "sdk_background_result has no deliverable route "
+                    "(session_key=%r, source=%s, adapter=%s) — requeued",
+                    evt.get("session_key"),
+                    "resolved" if source is not None else None,
+                    type(adapter).__name__ if adapter is not None else None,
+                )
+            else:
+                logger.debug(
+                    "sdk_background_result still unroutable (session_key=%r)",
+                    evt.get("session_key"),
+                )
+            return False
+        metadata = self._thread_metadata_for_source(source)
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            should_send_media_as_audio as _should_send_media_as_audio,
+        )
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            mark_delivered,
+            mark_failed,
+            record_obligation,
+        )
+        try:
+            _ledger_on = await asyncio.to_thread(ledger_enabled)
+        except Exception:
+            _ledger_on = False
+        _session_key = str(evt.get("session_key") or "")
+        _obligation_ref = f"sdk_bg:{evt.get('completed_at') or ''}"
+        _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        for idx, payload in enumerate(payloads):
+            _obligation_id = None
+            if _ledger_on:
+                try:
+                    _obligation_id = compute_obligation_id(
+                        _session_key, _obligation_ref, payload,
+                    )
+                    await asyncio.to_thread(
+                        record_obligation,
+                        obligation_id=_obligation_id,
+                        session_key=_session_key,
+                        platform=platform_name,
+                        chat_id=source.chat_id,
+                        thread_id=source.thread_id,
+                        content=payload,
+                    )
+                    await asyncio.to_thread(mark_attempting, _obligation_id)
+                except Exception:
+                    logger.debug(
+                        "sdk_background_result ledger record failed",
+                        exc_info=True,
+                    )
+                    _obligation_id = None
+            try:
+                media_files, text_content = adapter.extract_media(payload)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files
+                )
+                images, text_content = adapter.extract_images(text_content)
+                if text_content:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=text_content,
+                        metadata=metadata,
+                    )
+                for image_url, alt_text in (images or []):
+                    await adapter.send_image(
+                        chat_id=source.chat_id,
+                        image_url=image_url,
+                        caption=alt_text,
+                        metadata=metadata,
+                    )
+                for media_path, _is_voice in (media_files or []):
+                    _ext = os.path.splitext(media_path)[1].lower()
+                    if _should_send_media_as_audio(
+                        source.platform, _ext, _is_voice
+                    ):
+                        await adapter.send_voice(
+                            chat_id=source.chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif _ext in _VIDEO_EXTS:
+                        await adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif _ext in _IMAGE_EXTS:
+                        await adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    else:
+                        await adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+            except Exception as e:
+                if _obligation_id:
+                    try:
+                        await asyncio.to_thread(
+                            mark_failed, _obligation_id, str(e),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "sdk_background_result mark_failed failed",
+                            exc_info=True,
+                        )
+                evt["payloads"] = payloads[idx:]
+                logger.warning(
+                    "sdk_background_result send failed at payload %d/%d "
+                    "(%s) — remainder requeued",
+                    idx + 1, len(payloads), e,
+                )
+                return False
+            if _obligation_id:
+                try:
+                    await asyncio.to_thread(mark_delivered, _obligation_id)
+                except Exception:
+                    logger.debug(
+                        "sdk_background_result mark_delivered failed",
+                        exc_info=True,
+                    )
+        logger.info(
+            "sdk_background_result delivered: %d payload(s) to %s chat=%s",
+            len(payloads),
+            source.platform.value
+            if hasattr(source.platform, "value") else source.platform,
+            source.chat_id,
+        )
+        return True
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -22257,6 +22919,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
         queue has nothing for us; ignores non-async event types (those are
         handled by ``_run_process_watcher`` / the post-turn drain).
+
+        Also owns ``sdk_background_result`` events (a finished
+        claude-agent-sdk background task's answer burst): those are sent
+        DIRECTLY on the platform outbound lane via
+        ``_deliver_sdk_background_result`` — never re-injected as a turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
@@ -22272,7 +22939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
+                    if evt.get("type") in ("async_delegation", "sdk_background_result"):
                         async_events.append(evt)
                     else:
                         requeue.append(evt)
@@ -22280,6 +22947,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    if evt.get("type") == "sdk_background_result":
+                        try:
+                            delivered = await self._deliver_sdk_background_result(evt)
+                            if delivered is False:
+                                _pr.completion_queue.put(evt)
+                        except Exception as e:
+                            _pr.completion_queue.put(evt)
+                            logger.error(
+                                "SDK background-result delivery error: %s", e,
+                            )
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
@@ -23564,9 +24242,196 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # persisted session JSON on the next turn, so dropping it here is safe.
         if hasattr(agent, "_session_messages"):
             agent._session_messages = []
+        # _db_flush_scan_prefix is a shallow copy of the flushed transcript
+        # (run_agent.py, stamped on every successful flush) — it shares every
+        # message dict, so leaving it pins the multi-MB content strings the
+        # eviction exists to free. Pressure-evictable agents have flushed by
+        # definition, so this attribute is always populated on exactly the
+        # agents the memory valve targets.
+        if hasattr(agent, "_db_flush_scan_prefix"):
+            agent._db_flush_scan_prefix = None
+
+    def _agent_cache_bounds(self):
+        """Operator-configured agent-cache bounds, resolved once per process.
+
+        Resolved lazily rather than in ``__init__`` so it also works for the
+        ``__new__``-constructed runners used by tests and by the slash-command
+        mixin.
+        """
+        bounds = getattr(self, "_agent_cache_bounds_cache", None)
+        if bounds is None:
+            from gateway.agent_cache_pressure import resolve_agent_cache_bounds
+
+            try:
+                bounds = resolve_agent_cache_bounds(_load_gateway_config())
+            except Exception as _e:
+                logger.debug("Agent cache bounds config read failed: %s", _e)
+                # Resolve from an empty config rather than bare
+                # AgentCacheBounds(): the dataclass default has
+                # memory_high_mb=None (pressure pass OFF), but an *absent*
+                # config section means "auto" — a transient config read
+                # failure must not permanently disable the OOM valve this
+                # feature exists to provide.
+                bounds = resolve_agent_cache_bounds({})
+            self._agent_cache_bounds_cache = bounds
+        return bounds
+
+    def _agent_cache_cap(self) -> int:
+        """Effective LRU cap — the configured override, else the default."""
+        configured = self._agent_cache_bounds().max_size
+        return configured if configured else _AGENT_CACHE_MAX_SIZE
+
+    def _agent_cache_idle_ttl(self) -> float:
+        """Effective idle TTL in seconds — configured override, else default."""
+        configured = self._agent_cache_bounds().idle_ttl_secs
+        return configured if configured else _AGENT_CACHE_IDLE_TTL_SECS
+
+    def _sweep_agent_cache_under_pressure(self) -> int:
+        """Shed cached transcripts once the gateway's own heap nears its budget.
+
+        The LRU cap counts entries and the idle sweep counts seconds; neither
+        knows that one cached agent pins a full ``_session_messages``
+        transcript — tens of MB on a session with 100+ tool calls.  A gateway
+        serving many chats therefore holds every warm transcript indefinitely:
+        agents that took a turn within the TTL are never idle-swept, and the
+        sweep additionally defers finalizable sessions until they expire.  RSS
+        climbs until the cgroup throttles and SIGTERM can no longer flush
+        inside systemd's stop timeout (#80764).
+
+        This is the missing valve.  Above the configured anonymous-RSS budget
+        it evicts LRU agents through the same soft path the cap enforcer uses,
+        so the transcript is dropped and rebuilt from the persisted session on
+        the next turn.  Three things are never touched: agents mid-turn (their
+        clients and sandboxes are in use), the most recently used sessions
+        (whose prompt cache is worth the most), and any session whose live
+        transcript has not finished reaching disk.
+
+        Returns the number of entries evicted (0 when memory is fine).
+        """
+        from gateway.agent_cache_pressure import (
+            plan_pressure_evictions,
+            read_anon_rss_mb,
+            transcript_persistence_caught_up,
+        )
+
+        bounds = self._agent_cache_bounds()
+        if not bounds.memory_high_mb:
+            return 0
+        _cache = getattr(self, "_agent_cache", None)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if not _cache or _lock is None:
+            # Nothing cached — whatever is using the heap, it isn't us, and
+            # warning about it every tick would point at the wrong subsystem.
+            return 0
+
+        rss_mb = read_anon_rss_mb()
+        if rss_mb is None or rss_mb < bounds.memory_high_mb:
+            return 0
+
+        running_ids = {
+            id(a)
+            for _, a in self._running_agent_items()
+            if a is not None and a is not _AGENT_PENDING_SENTINEL
+        }
+
+        def _is_evictable(key: str, agent: Any) -> bool:
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                return False
+            if id(agent) in running_ids:
+                return False
+            return transcript_persistence_caught_up(agent)
+
+        with _lock:
+            ordered = [
+                (key, entry[0] if isinstance(entry, tuple) and entry else entry)
+                for key, entry in _cache.items()
+            ]
+            plan = plan_pressure_evictions(
+                ordered,
+                is_evictable=_is_evictable,
+                max_evictions=bounds.max_evictions_per_pass,
+                protect_recent=bounds.protect_recent,
+            )
+            for key, _ in plan:
+                _cache.pop(key, None)
+
+        if not plan:
+            _mid_turn = sum(1 for _, a in ordered if a is not None and id(a) in running_ids)
+            _unflushed = sum(
+                1
+                for _, a in ordered
+                if a is not None
+                and a is not _AGENT_PENDING_SENTINEL
+                and id(a) not in running_ids
+                and not transcript_persistence_caught_up(a)
+            )
+            logger.warning(
+                "Agent cache pressure: anon RSS %dMB over budget %dMB but no "
+                "evictable session (%d cached, %d mid-turn, %d blocked on "
+                "un-flushed persistence)%s",
+                rss_mb, bounds.memory_high_mb, len(ordered), _mid_turn, _unflushed,
+                (
+                    " — transcripts are not reaching the session DB "
+                    "(session persistence disabled or failing?); the memory "
+                    "valve cannot shed sessions until they persist."
+                    if _unflushed and not _mid_turn
+                    else " — memory will keep climbing until those turns finish."
+                ),
+            )
+            return 0
+
+        evicted_count = len(plan)
+        logger.warning(
+            "Agent cache pressure: anon RSS %dMB over budget %dMB — evicting "
+            "%d LRU session(s): %s",
+            rss_mb, bounds.memory_high_mb, evicted_count,
+            ", ".join(key for key, _ in plan),
+        )
+        try:
+            threading.Thread(
+                target=self._release_pressure_batch,
+                args=(plan,),
+                daemon=True,
+                name="agent-cache-pressure",
+            ).start()
+        except Exception:
+            self._release_pressure_batch(plan)
+        # NOTE: _release_pressure_batch drains `plan` in place (so the trim
+        # runs with no lingering agent references) — len(plan) is 0 by the
+        # time the daemon thread finishes, hence the pre-captured count.
+        return evicted_count
+
+    def _release_pressure_batch(self, plan: List[tuple]) -> None:
+        """Release a pressure-evicted batch, then return the heap to the OS.
+
+        Sequential on one daemon thread rather than a thread per agent: the
+        batch is already capped, and the point of the pass is to reclaim
+        memory, not to race N teardowns. The trailing ``malloc_trim`` is what
+        turns "Python dropped the transcript" into "RSS actually fell" —
+        without it glibc keeps the freed arenas and the cgroup never notices.
+
+        The plan is drained (``pop`` + ``del``) rather than iterated so that
+        no local reference pins the evicted agents when ``gc.collect`` +
+        ``malloc_trim`` run — otherwise the trim frees almost nothing in this
+        pass, the next tick re-reads a still-high RSS, and the valve
+        over-evicts an extra batch of warm prompt caches every cycle.
+        """
+        while plan:
+            key, agent = plan.pop(0)  # FIFO — evict LRU-first order preserved
+            try:
+                self._commit_then_release_soft(agent, key)
+            except Exception as _e:
+                logger.debug("Pressure release failed for %s: %s", key, _e)
+            del agent
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(force=True, reason="agent_cache_pressure")
+        except Exception:
+            pass
 
     def _enforce_agent_cache_cap(self) -> None:
-        """Evict oldest cached agents when cache exceeds _AGENT_CACHE_MAX_SIZE.
+        """Evict oldest cached agents when cache exceeds the LRU cap.
 
         Must be called with _agent_cache_lock held.  Resource cleanup
         (memory provider shutdown, tool resource close) is scheduled
@@ -23606,7 +24471,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # already-cached long-running one.  The cache may therefore stay
         # temporarily over cap; it will re-check on the next insert,
         # after active turns have finished.
-        excess = max(0, len(_cache) - _AGENT_CACHE_MAX_SIZE)
+        cap = self._agent_cache_cap()
+        excess = max(0, len(_cache) - cap)
         evict_plan: List[tuple] = []  # [(key, agent), ...]
         if excess > 0:
             ordered_keys = list(_cache.keys())
@@ -23620,12 +24486,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for key, _ in evict_plan:
             _cache.pop(key, None)
 
-        remaining_over_cap = len(_cache) - _AGENT_CACHE_MAX_SIZE
+        remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
             logger.warning(
                 "Agent cache over cap (%d > %d); %d excess slot(s) held by "
                 "mid-turn agents — will re-check on next insert.",
-                len(_cache), _AGENT_CACHE_MAX_SIZE, remaining_over_cap,
+                len(_cache), cap, remaining_over_cap,
             )
 
         for key, agent in evict_plan:
@@ -23648,7 +24514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).start()
 
     def _sweep_idle_cached_agents(self) -> int:
-        """Evict cached agents whose AIAgent has been idle > _AGENT_CACHE_IDLE_TTL_SECS.
+        """Evict cached agents whose AIAgent has been idle past the idle TTL.
 
         Safe to call from the session expiry watcher without holding the
         cache lock — acquires it internally.  Returns the number of entries
@@ -23663,6 +24529,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _cache is None or _lock is None:
             return 0
         now = time.time()
+        idle_ttl = self._agent_cache_idle_ttl()
         to_evict: List[tuple] = []
         running_ids = {
             id(a)
@@ -23679,7 +24546,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None:
                     continue
-                if (now - last_activity) > _AGENT_CACHE_IDLE_TTL_SECS:
+                if (now - last_activity) > idle_ttl:
                     # Check whether the session has actually expired in the
                     # session store.  If it hasn't (e.g. daily-reset mode
                     # where the reset fires hours after the user's last
