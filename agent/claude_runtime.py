@@ -861,6 +861,13 @@ def _tool_result_content(agent, tool_name: str, content: Any) -> Any:
     return envelope["text_summary"]
 
 
+# Minimum spacing between ``_touch_activity`` calls fired from dispatched SDK
+# messages. StreamEvent alone can arrive once per token; the watchdogs that
+# consume ``_last_activity_ts`` only care about staleness on the order of
+# seconds to minutes, so anything finer is wasted work rather than signal.
+_STREAM_HEARTBEAT_THROTTLE_SECONDS = 1.0
+
+
 class ClaudeEventProjector:
     """Project one SDK response stream into Hermes callbacks + messages.
 
@@ -901,6 +908,7 @@ class ClaudeEventProjector:
         self._pending_results: Dict[str, Any] = {}
         self._tool_started_at: Dict[str, float] = {}
         self._finalized = False
+        self._last_heartbeat_touch_at: Optional[float] = None
 
     # -- entry point -------------------------------------------------------
 
@@ -919,6 +927,25 @@ class ClaudeEventProjector:
         # behaves identically against the real optional extra and the stand-in
         # the suite installs when it is absent.
         kind = type(message).__name__
+        # Every SDK message is a heartbeat: a long turn (a slow tool, a quiet
+        # stretch between StreamEvents) must not look stalled to the generic
+        # watchdogs that key off ``_last_activity_ts`` (kanban worker
+        # reclaim, delegate subagent timeout diagnostics). Throttled — a
+        # streamed turn fires one StreamEvent per content-block delta
+        # (per token), and watchdogs above only care about second-to-minute
+        # staleness (kanban's own bridge is rate-limited to 60s; delegate's
+        # heartbeat loop ticks every 30s — see ``_HEARTBEAT_INTERVAL`` in
+        # tools/delegate_tool.py), so touching on every delta is pure
+        # overhead. Routed through ``_fire`` for the same getattr guard the
+        # display callbacks get, since ``self._agent`` in tests is a
+        # stand-in that may not define every agent method.
+        now = time.monotonic()
+        if (
+            self._last_heartbeat_touch_at is None
+            or (now - self._last_heartbeat_touch_at) >= _STREAM_HEARTBEAT_THROTTLE_SECONDS
+        ):
+            self._last_heartbeat_touch_at = now
+            self._fire("_touch_activity", f"claude sdk: {kind}")
         if kind == "StreamEvent":
             self._on_stream_event(message)
         elif kind == "AssistantMessage":

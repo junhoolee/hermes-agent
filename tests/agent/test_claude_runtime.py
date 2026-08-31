@@ -533,6 +533,78 @@ def test_a_multi_tool_streaming_turn_fires_the_canonical_callbacks():
     assert projector.tool_iterations == 2
 
 
+def test_every_dispatched_message_touches_the_activity_heartbeat(monkeypatch):
+    """A quiet stretch between SDK messages must not look like a stalled
+    turn to the generic watchdogs that key off ``_last_activity_ts``
+    (kanban worker reclaim, delegate subagent timeout diagnostics)."""
+    agent = _make_agent("web_search")
+    _Recorder(agent)
+    touches: list[str] = []
+    agent._touch_activity = lambda desc: touches.append(desc)
+    projector = ClaudeEventProjector(agent)
+
+    # Space dispatches beyond the throttle window so each message lands as
+    # its own heartbeat tick, matching a real turn where messages are
+    # seconds apart rather than back-to-back in a test loop.
+    clock = [0.0]
+
+    def _fake_monotonic() -> float:
+        clock[0] += claude_runtime._STREAM_HEARTBEAT_THROTTLE_SECONDS + 0.1
+        return clock[0]
+
+    monkeypatch.setattr(claude_runtime.time, "monotonic", _fake_monotonic)
+
+    messages = [
+        SystemMessage("init", {"session_id": "sdk-session-1"}),
+        _text_delta("Looking that up"),
+        AssistantMessage(content=[TextBlock("Looking that up")]),
+        ResultMessage(result="Looking that up"),
+    ]
+    for message in messages:
+        projector(message)
+
+    assert len(touches) == len(messages)
+    assert all("claude sdk" in desc for desc in touches)
+
+
+def test_rapid_stream_events_throttle_to_a_single_heartbeat_touch():
+    """``StreamEvent`` fires once per content-block delta — roughly once per
+    token during a streamed turn. Touching ``_last_activity_ts`` on every
+    single one is pure overhead for watchdogs that only care about
+    staleness on the order of seconds to minutes (see
+    ``_STREAM_HEARTBEAT_THROTTLE_SECONDS``), so a burst arriving within one
+    wall-clock instant must collapse to a single touch."""
+    agent = _make_agent("web_search")
+    _Recorder(agent)
+    touches: list[str] = []
+    agent._touch_activity = lambda desc: touches.append(desc)
+    projector = ClaudeEventProjector(agent)
+
+    for _ in range(25):
+        projector(_text_delta("a"))
+
+    assert len(touches) == 1
+
+
+def test_dispatch_survives_an_agent_stand_in_without_touch_activity():
+    """``self._agent`` is sometimes a lightweight stand-in that doesn't
+    define every ``AIAgent`` method. The heartbeat touch must go through
+    the same ``getattr`` guard the display callbacks already get via
+    ``_fire`` — a missing ``_touch_activity`` must never raise out of
+    dispatch."""
+    agent = SimpleNamespace()
+    recorder = _Recorder(agent)
+    assert not hasattr(agent, "_touch_activity")
+    projector = ClaudeEventProjector(agent)
+
+    projector(SystemMessage("init", {"session_id": "sdk-session-1"}))
+    projector(_text_delta("hi"))
+    projector(AssistantMessage(content=[TextBlock("hi")]))
+    projector(ResultMessage(result="hi"))
+
+    assert recorder.text == ["hi"]
+
+
 def test_streamed_text_is_not_replayed_when_the_block_completes():
     agent = _make_agent("web_search")
     rec = _Recorder(agent)
