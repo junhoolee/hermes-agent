@@ -1546,6 +1546,42 @@ def _configured_start_timeout() -> Optional[float]:
     return claude_subscription_start_timeout(config)
 
 
+# Unset means "protect by default", the inverse of `_configured_start_timeout`
+# — a silently wedged SDK turn is exactly the failure mode this guards
+# against, so there is no safe way for absence of config to mean "off".
+DEFAULT_STALL_TIMEOUT_SECONDS = 300.0
+
+
+def _configured_stall_timeout() -> Optional[float]:
+    """The user's `claude_subscription.stall_timeout`, or the built-in default.
+
+    Tolerates a missing, empty, or malformed config the same way
+    ``_configured_start_timeout`` does, but an explicit ``0`` means
+    "disable the watchdog" (returns None) rather than "use the default" —
+    the only way an operator can turn this off on purpose.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        logger.debug("claude stall_timeout config load failed", exc_info=True)
+        return DEFAULT_STALL_TIMEOUT_SECONDS
+    section = config.get("claude_subscription") if isinstance(config, dict) else None
+    if not isinstance(section, dict):
+        return DEFAULT_STALL_TIMEOUT_SECONDS
+    raw = section.get("stall_timeout")
+    if isinstance(raw, bool) or raw is None:
+        return DEFAULT_STALL_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_STALL_TIMEOUT_SECONDS
+    if value == 0:
+        return None
+    return value if value > 0 else DEFAULT_STALL_TIMEOUT_SECONDS
+
+
 def _ensure_session(agent, effective_task_id: str) -> Any:
     """Return this agent's ``ClaudeAgentSession``, building it on first turn.
 
@@ -1863,6 +1899,8 @@ def run_claude_agent_sdk_turn(
                 prompt,
                 on_message=projector,
                 timeout=DEFAULT_TURN_TIMEOUT_SECONDS,
+                stall_timeout=_configured_stall_timeout(),
+                stall_exempt=lambda: getattr(agent, "_claude_bridge_inflight", 0) > 0,
             )
         except TimeoutError as exc:
             turn_error = str(exc)
