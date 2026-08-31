@@ -2197,8 +2197,43 @@ def run_conversation(
     # bypassed entirely; Hermes still owns tool execution via the in-process
     # MCP bridge. See agent/claude_runtime.py and
     # docs/design/claude-subscription-via-agent-sdk.md for the ownership split.
-    if agent.api_mode == "claude_agent_sdk":
-        return agent._run_claude_agent_sdk_turn(
+    #
+    # A hard SDK failure (preflight refusal, billing refusal, session
+    # construction error, or a run_turn exception with no stale-session
+    # recovery — see claude_runtime._failure_result) is the mirror image of
+    # the mid-turn codex 429 that _handoff_turn_to_claude_agent_sdk exists
+    # for below: advance the fallback chain instead of surfacing the
+    # failure straight to the user. A user-requested interrupt is not a
+    # failure in this sense and is returned as-is, never handed off.
+    while agent.api_mode == "claude_agent_sdk":
+        sdk_result = agent._run_claude_agent_sdk_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+        if not sdk_result.get("failed") or sdk_result.get("interrupted"):
+            return sdk_result
+        if agent._try_activate_fallback():
+            logger.warning(
+                "claude_agent_sdk turn failed (%s); advanced fallback chain to %s/%s",
+                sdk_result.get("error"),
+                getattr(agent, "provider", None),
+                getattr(agent, "model", None),
+            )
+            # Loop re-checks agent.api_mode: another claude_agent_sdk entry in
+            # the chain retries this block; anything else falls out below —
+            # codex_app_server dispatches immediately after, everything else
+            # (chat_completions et al.) falls through into the retry loop,
+            # whose outer iteration re-runs the pre-API preflight. Kept as a
+            # direct ``if agent._try_activate_fallback(): ... continue`` site
+            # so the #84733 source guard can bind its restart discipline.
+            continue
+        return sdk_result
+
+    if agent.api_mode == "codex_app_server":
+        return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,

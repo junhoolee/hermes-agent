@@ -719,6 +719,155 @@ class TestClaudeAgentSdkFallback:
         agent._release_claude_agent_sdk_session.assert_called_once()
         assert agent.api_mode == "chat_completions"
 
+    def test_failed_sdk_turn_hands_off_to_the_fallback_chain(self):
+        """Reverse of test_midturn_429_hands_the_same_turn_to_the_sdk_runtime:
+        the PRIMARY runtime is claude_agent_sdk and the turn fails outright
+        (preflight refusal, session-construction error, or an unrecoverable
+        run_turn exception — see claude_runtime._failure_result). The
+        pre-loop dispatch in run_conversation() must advance the fallback
+        chain and let the next entry serve the turn instead of surfacing
+        the SDK failure straight to the user."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.api_mode = "claude_agent_sdk"
+        agent.provider = "claude-code"
+        agent.model = "claude-sonnet-5"
+        agent.base_url = "claude-sdk://subscription"
+        agent.client = None
+        agent._release_claude_agent_sdk_session = MagicMock()
+
+        sdk_turns = []
+
+        def _sdk_turn(**kwargs):
+            sdk_turns.append(kwargs)
+            return {
+                "final_response": "Claude Agent SDK could not start: boom",
+                "messages": kwargs["messages"],
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "interrupted": False,
+                "error": "boom",
+            }
+
+        agent._run_claude_agent_sdk_turn = _sdk_turn
+        mock_fb_client = _mock_client(base_url="https://open.bigmodel.cn/api/coding/paas/v4")
+
+        def _fake_api_call(api_kwargs):
+            msg = SimpleNamespace(content="served by the fallback chain", tool_calls=None)
+            choice = SimpleNamespace(message=msg, finish_reason="stop")
+            return SimpleNamespace(choices=[choice], model="glm-4.7", usage=None)
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "glm-4.7"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=200000,
+            ),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert len(sdk_turns) == 1, (
+            "the SDK runtime must be tried exactly once before falling "
+            f"back, got result: {result.get('final_response')!r}"
+        )
+        agent._release_claude_agent_sdk_session.assert_called_once()
+        assert agent.api_mode == "chat_completions"
+        assert agent.provider == "zai"
+        assert agent.model == "glm-4.7"
+        assert result["completed"] is True
+        assert result["final_response"] == "served by the fallback chain"
+
+    def test_sdk_turn_failure_with_exhausted_chain_surfaces_the_failure(self):
+        """No fallback chain configured — the SDK failure must be returned
+        as-is, not swallowed."""
+        agent = _make_agent(fallback_model=None)
+        agent.api_mode = "claude_agent_sdk"
+        agent.provider = "claude-code"
+        agent.model = "claude-sonnet-5"
+        agent.base_url = "claude-sdk://subscription"
+        agent.client = None
+
+        def _sdk_turn(**kwargs):
+            return {
+                "final_response": "Claude Agent SDK could not start: boom",
+                "messages": kwargs["messages"],
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "interrupted": False,
+                "error": "boom",
+            }
+
+        agent._run_claude_agent_sdk_turn = _sdk_turn
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert agent.api_mode == "claude_agent_sdk"
+
+    def test_interrupted_sdk_turn_is_not_handed_off(self):
+        """A user-requested interrupt carries failed=True too, but it is
+        not a runtime failure — it must be returned as-is and must not
+        burn a fallback-chain slot."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.api_mode = "claude_agent_sdk"
+        agent.provider = "claude-code"
+        agent.model = "claude-sonnet-5"
+        agent.base_url = "claude-sdk://subscription"
+        agent.client = None
+
+        calls = {"n": 0}
+
+        def _sdk_turn(**kwargs):
+            calls["n"] += 1
+            return {
+                "final_response": "",
+                "messages": kwargs["messages"],
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "interrupted": True,
+                "error": None,
+            }
+
+        agent._run_claude_agent_sdk_turn = _sdk_turn
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["n"] == 1
+        assert result["interrupted"] is True
+        assert agent.api_mode == "claude_agent_sdk"
+
     def test_gate_closed_claude_code_uses_anthropic_wire_with_oauth_detection(self):
         """While the subscription gate is shut, claude-code still means the
         legacy anthropic path — and the OAuth-token detection must apply to
