@@ -1763,6 +1763,26 @@ def _recover_stale_session(
     return prepend_text_to_prompt(user_message, prefix)
 
 
+def _attach_leftover_steer(agent, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Hand back any /steer that outlived every bridged tool call this turn.
+
+    ``claude_tool_bridge._append_pending_steer`` delivers a steer as soon as
+    the next tool result goes back to Claude. When no more tool calls happen
+    this turn — the steer arrived after the last one, the turn used no tools
+    at all, or the turn failed before any tool ran — draining here is what
+    stops it being silently lost. Mirrors ``turn_finalizer``'s
+    ``pending_steer`` handoff for the chat_completions path: the callers in
+    ``tui_gateway/server.py``, ``cli.py``, and ``gateway/run.py`` already
+    read ``result["pending_steer"]`` off any runtime's result dict and
+    requeue it as the next user turn.
+    """
+    drain: Optional[Callable[[], Optional[str]]] = getattr(agent, "_drain_pending_steer", None)
+    leftover_steer = drain() if callable(drain) else None
+    if leftover_steer:
+        result["pending_steer"] = leftover_steer
+    return result
+
+
 def _failure_result(
     agent,
     messages: List[Dict[str, Any]],
@@ -1776,7 +1796,7 @@ def _failure_result(
     )
     if user_interrupted:
         agent.clear_interrupt()
-    return {
+    return _attach_leftover_steer(agent, {
         "final_response": final_response,
         "messages": messages,
         "api_calls": 0,
@@ -1786,7 +1806,7 @@ def _failure_result(
         "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
         "error": error,
-    }
+    })
 
 
 def run_claude_agent_sdk_turn(
@@ -2016,7 +2036,7 @@ def run_claude_agent_sdk_turn(
     if turn_error and not final_text:
         final_text = f"Claude Agent SDK turn failed: {turn_error}"
 
-    return {
+    return _attach_leftover_steer(agent, {
         "final_response": final_text,
         "messages": messages,
         "api_calls": 1,
@@ -2029,7 +2049,7 @@ def run_claude_agent_sdk_turn(
         "claude_session_id": projector.session_id,
         "claude_terminal_reason": projector.terminal_reason,
         **usage_result,
-    }
+    })
 
 
 __all__ = [
@@ -2038,6 +2058,7 @@ __all__ = [
     "MAX_SESSION_RECOVERIES",
     "RUNTIME_LABEL",
     "ClaudeEventProjector",
+    "_attach_leftover_steer",
     "build_claude_agent_options",
     "claude_bootstrap_prefix",
     "claude_project_key",

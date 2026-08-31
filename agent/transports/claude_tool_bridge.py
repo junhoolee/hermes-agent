@@ -32,6 +32,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 from agent.display import _detect_tool_failure
+from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
@@ -181,6 +182,33 @@ def _resolve_task_id(effective_task_id: Any) -> str:
     return str(effective_task_id or "")
 
 
+def _append_pending_steer(agent, response: dict[str, Any]) -> dict[str, Any]:
+    """Append any pending /steer text to a bridged tool response, in place.
+
+    The SDK owns the tool loop in this runtime, so there is no messages list
+    to inject into the way ``apply_pending_steer_to_tool_results`` does for
+    the chat_completions path. The MCP tool result is the equivalent
+    channel: appending a marker text block here rides back to Claude as part
+    of the same ``tool_result`` the model is already waiting on, using the
+    exact marker format Claude is told about in its own system prompt
+    (``STEER_CHANNEL_NOTE``). Draining is per-tool-call so a steer sent while
+    several bridged tools are in flight lands on whichever result comes back
+    first, instead of waiting for the whole batch.
+    """
+    drain: Optional[Callable[[], Optional[str]]] = getattr(agent, "_drain_pending_steer", None)
+    steer_text = drain() if callable(drain) else None
+    if not steer_text:
+        return response
+    marker = format_steer_marker(steer_text)
+    response.setdefault("content", []).append({"type": "text", "text": marker.lstrip()})
+    logger.debug(
+        "claude_agent_sdk bridge delivered /steer via tool result (%d chars): %s",
+        len(steer_text),
+        steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
+    )
+    return response
+
+
 def run_bridged_tool(
     agent,
     tool_name: str,
@@ -217,7 +245,7 @@ def run_bridged_tool(
             "is_error"
         ):
             response["is_error"] = True
-        return response
+        return _append_pending_steer(agent, response)
     finally:
         with _INFLIGHT_LOCK:
             agent._claude_bridge_inflight = getattr(agent, "_claude_bridge_inflight", 0) - 1
@@ -335,6 +363,7 @@ __all__ = [
     "is_read_only_tool",
     "tool_result_content_blocks",
     "build_tool_response",
+    "_append_pending_steer",
     "run_bridged_tool",
     "build_bridged_sdk_tools",
     "build_hermes_sdk_mcp_server",
