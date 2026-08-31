@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import sys
+import threading
 import types
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -280,6 +281,89 @@ def test_denied_tool_call_never_dispatches_and_reports_an_error(sdk_module):
     raw_dispatch.assert_not_called()
     assert response["is_error"] is True
     assert "denied by policy" in response["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Stall-watchdog exemption: run_bridged_tool tracks in-flight bridged calls
+# ---------------------------------------------------------------------------
+
+
+def _fake_outcome(tool_call):
+    from agent.tool_executor import ToolExecutionOutcome
+
+    return ToolExecutionOutcome(
+        tool_call=tool_call,
+        tool_call_id=tool_call.id,
+        function_name=tool_call.function.name,
+        function_args={},
+        result=json.dumps({"ok": True}),
+        duration=0.0,
+        is_error=False,
+        blocked=False,
+        cancelled=False,
+        malformed=False,
+        middleware_trace=[],
+    )
+
+
+def test_run_bridged_tool_marks_inflight_during_execution_and_clears_after(sdk_module):
+    agent = _make_agent("web_search")
+    seen = {}
+
+    def _fake_execute(bound_agent, tool_call, task_id, **kwargs):
+        seen["during"] = getattr(bound_agent, "_claude_bridge_inflight", 0)
+        return _fake_outcome(tool_call)
+
+    assert getattr(agent, "_claude_bridge_inflight", 0) == 0
+    with (
+        patch.object(bridge, "execute_one_tool", side_effect=_fake_execute),
+        patch.object(bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result),
+    ):
+        bridge.run_bridged_tool(agent, "web_search", {"query": "x"}, "task-1")
+
+    assert seen["during"] == 1
+    assert agent._claude_bridge_inflight == 0
+
+
+def test_run_bridged_tool_decrements_inflight_even_when_execution_raises(sdk_module):
+    agent = _make_agent("web_search")
+
+    with patch.object(bridge, "execute_one_tool", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            bridge.run_bridged_tool(agent, "web_search", {}, "task-1")
+
+    assert agent._claude_bridge_inflight == 0
+
+
+def test_run_bridged_tool_inflight_counts_concurrent_calls(sdk_module):
+    """Two bridged tools genuinely overlapping must both be counted, and the
+    lazily-initialised counter must not race under concurrent increments."""
+    agent = _make_agent("web_search")
+    barrier = threading.Barrier(2, timeout=5)
+    peak = []
+    peak_lock = threading.Lock()
+
+    def _fake_execute(bound_agent, tool_call, task_id, **kwargs):
+        barrier.wait()
+        with peak_lock:
+            peak.append(getattr(bound_agent, "_claude_bridge_inflight", 0))
+        return _fake_outcome(tool_call)
+
+    def _run():
+        bridge.run_bridged_tool(agent, "web_search", {}, "task-1")
+
+    with (
+        patch.object(bridge, "execute_one_tool", side_effect=_fake_execute),
+        patch.object(bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result),
+    ):
+        threads = [threading.Thread(target=_run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+    assert max(peak) == 2
+    assert agent._claude_bridge_inflight == 0
 
 
 # ---------------------------------------------------------------------------

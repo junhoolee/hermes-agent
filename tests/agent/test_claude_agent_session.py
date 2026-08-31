@@ -294,6 +294,68 @@ def test_interrupt_before_start_is_a_no_op():
 
 
 # ---------------------------------------------------------------------------
+# Stall watchdog
+# ---------------------------------------------------------------------------
+
+
+def test_stall_timeout_fires_when_the_stream_goes_silent():
+    session, _client = _session(
+        [[AssistantMessage("first"), 2.0, AssistantMessage("second"), ResultMessage()]]
+    )
+    try:
+        with pytest.raises(TimeoutError, match="stalled"):
+            _collect(session, "hi", stall_timeout=0.3, timeout=10.0)
+    finally:
+        session.close()
+
+
+def test_stall_timeout_message_is_distinct_from_the_deadline_message():
+    session, _client = _session([[AssistantMessage("first"), 2.0, AssistantMessage("second")]])
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            _collect(session, "hi", stall_timeout=0.3, timeout=10.0)
+    finally:
+        session.close()
+    assert "stalled" in str(excinfo.value)
+    assert "exceeded" not in str(excinfo.value)
+
+
+def test_stall_exempt_holds_off_the_stall_clock():
+    session, _client = _session(
+        [[AssistantMessage("first"), 2.0, AssistantMessage("second"), ResultMessage()]]
+    )
+    try:
+        seen = _collect(
+            session, "hi", stall_timeout=0.3, stall_exempt=lambda: True, timeout=10.0
+        )
+    finally:
+        session.close()
+    assert [m.tag for m in seen] == ["first", "second", ""]
+
+
+def test_a_steady_stream_never_trips_the_stall_watchdog():
+    session, _client = _session(
+        [[AssistantMessage("1"), AssistantMessage("2"), ResultMessage("3")]]
+    )
+    try:
+        seen = _collect(session, "hi", stall_timeout=0.3)
+    finally:
+        session.close()
+    assert [m.tag for m in seen] == ["1", "2", "3"]
+
+
+def test_stall_timeout_defaults_to_disabled():
+    """A gap that would trip a configured stall_timeout must not raise when
+    the caller leaves it unset — existing behavior is preserved."""
+    session, _client = _session([[AssistantMessage("first"), 0.4, ResultMessage("done")]])
+    try:
+        seen = _collect(session, "hi", timeout=10.0)
+    finally:
+        session.close()
+    assert [m.tag for m in seen] == ["first", "done"]
+
+
+# ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
 

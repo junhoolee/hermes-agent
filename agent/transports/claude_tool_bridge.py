@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import uuid
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -47,6 +48,13 @@ MCP_SERVER_VERSION = "1.0.0"
 MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER_NAME}__"
 
 _DATA_URL_PREFIX = "data:"
+
+# Guards ``agent._claude_bridge_inflight`` increment/decrement — parallel
+# read-tool batches run several bridged tools at once on different worker
+# threads, and the counter is lazily initialised on the agent (no __init__
+# owns it), so both the init-on-first-use and the +=/-= must happen under
+# one lock shared by every call.
+_INFLIGHT_LOCK = threading.Lock()
 
 
 def mcp_tool_name(tool_name: str) -> str:
@@ -194,19 +202,25 @@ def run_bridged_tool(
             arguments=json.dumps(args or {}, ensure_ascii=False),
         ),
     )
-    outcome = execute_one_tool(
-        agent,
-        tool_call,
-        _resolve_task_id(effective_task_id),
-        messages=messages,
-    )
-    result = finalize_tool_outcome(agent, outcome)
-    response = build_tool_response(outcome.function_name, result)
-    if (outcome.is_error or outcome.blocked or outcome.cancelled) and not response.get(
-        "is_error"
-    ):
-        response["is_error"] = True
-    return response
+    with _INFLIGHT_LOCK:
+        agent._claude_bridge_inflight = getattr(agent, "_claude_bridge_inflight", 0) + 1
+    try:
+        outcome = execute_one_tool(
+            agent,
+            tool_call,
+            _resolve_task_id(effective_task_id),
+            messages=messages,
+        )
+        result = finalize_tool_outcome(agent, outcome)
+        response = build_tool_response(outcome.function_name, result)
+        if (outcome.is_error or outcome.blocked or outcome.cancelled) and not response.get(
+            "is_error"
+        ):
+            response["is_error"] = True
+        return response
+    finally:
+        with _INFLIGHT_LOCK:
+            agent._claude_bridge_inflight = getattr(agent, "_claude_bridge_inflight", 0) - 1
 
 
 def build_bridged_sdk_tools(
