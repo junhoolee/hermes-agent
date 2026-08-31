@@ -1231,3 +1231,235 @@ def test_last_prompt_tokens_falls_back_to_cumulative_without_per_call_usage():
 
     assert result["last_prompt_tokens"] == 12
     assert agent.context_compressor.last_prompt_tokens == 12
+
+
+# ---------------------------------------------------------------------------
+# Ack-continuation: a turn that only announces intent re-queries the SAME
+# SDK session, mirroring the codex loop's `codex_ack_continuations < 2`.
+# ---------------------------------------------------------------------------
+
+
+class _MultiCallSession:
+    """Like ``_StubSession`` but scripts a *different* message list per
+    successive ``run_turn`` call — ack-continuation issues more than one
+    ``run_turn`` against the same session object."""
+
+    def __init__(self, scripts, *, raises_on=None):
+        self.scripts = list(scripts)
+        self.raises_on = raises_on or {}
+        self.calls = 0
+        self.prompts = []
+        self.session_ids = []
+        self.closed = False
+
+    def run_turn(
+        self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None
+    ):
+        index = self.calls
+        self.calls += 1
+        self.prompts.append(prompt)
+        if index in self.raises_on:
+            raise self.raises_on[index]
+        script = self.scripts[index] if index < len(self.scripts) else []
+        for message in script:
+            on_message(message)
+        return len(script)
+
+    def note_session_id(self, session_id):
+        self.session_ids.append(session_id)
+
+    def close(self):
+        self.closed = True
+
+
+_ACK_SCRIPT = [
+    AssistantMessage(content=[TextBlock("I'll look into the repo now.")]),
+    ResultMessage(result="I'll look into the repo now."),
+]
+
+
+def _run_turn_multi(agent, session, *, user_message="hi", original_user_message="hi", messages=None):
+    messages = messages if messages is not None else []
+    with (
+        patch.object(claude_runtime, "claude_runtime_preflight", return_value=None),
+        patch.object(claude_runtime, "_ensure_session", return_value=session),
+    ):
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id="task-1",
+        )
+    return result, messages
+
+
+def test_an_ack_only_reply_re_queries_the_same_session():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    interim = []
+    agent._emit_interim_assistant_message = interim.append
+    session = _MultiCallSession(
+        [
+            _ACK_SCRIPT,
+            [
+                AssistantMessage(content=[TextBlock("Done, found nothing.")]),
+                ResultMessage(result="Done, found nothing."),
+            ],
+        ]
+    )
+    result, messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 2
+    assert session.prompts[1] == claude_runtime._ACK_CONTINUE_TEXT
+    assert result["api_calls"] == 2
+    assert result["final_response"] == "Done, found nothing."
+    assert interim and interim[0]["content"] == "I'll look into the repo now."
+    assert any(
+        m.get("role") == "user" and m.get("content") == claude_runtime._ACK_CONTINUE_TEXT
+        for m in messages
+    )
+
+
+def test_ack_continuation_caps_at_two_re_queries():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    agent._emit_interim_assistant_message = lambda *_a, **_kw: None
+    session = _MultiCallSession([_ACK_SCRIPT, _ACK_SCRIPT, _ACK_SCRIPT])
+    result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 3
+    assert result["api_calls"] == 3
+    assert result["final_response"] == "I'll look into the repo now."
+
+
+def test_a_non_ack_reply_never_re_queries():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    session = _MultiCallSession(
+        [
+            [
+                AssistantMessage(content=[TextBlock("The answer is 42.")]),
+                ResultMessage(result="The answer is 42."),
+            ]
+        ]
+    )
+    result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 1
+    assert result["api_calls"] == 1
+
+
+def test_ack_continuation_is_off_by_default_for_claude_agent_sdk():
+    """``intent_ack_continuation_mode``'s ``"auto"`` fallback is codex-only;
+    the SDK path needs the same explicit opt-in any other non-codex api_mode
+    does."""
+    agent = _make_agent("web_search")
+    session = _MultiCallSession([_ACK_SCRIPT])
+    result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 1
+    assert result["api_calls"] == 1
+
+
+def test_the_config_kill_switch_disables_continuation_even_when_opted_in():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    session = _MultiCallSession([_ACK_SCRIPT])
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"ack_continuation": False}},
+    ):
+        result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 1
+    assert result["api_calls"] == 1
+
+
+def test_an_interrupted_attempt_never_re_queries():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    agent._interrupt_requested = True
+    session = _MultiCallSession([_ACK_SCRIPT])
+    result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 1
+    assert result["interrupted"] is True
+
+
+def test_an_sdk_reported_error_never_re_queries():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    session = _MultiCallSession(
+        [
+            [
+                AssistantMessage(content=[TextBlock("I'll look into the repo now.")]),
+                ResultMessage(
+                    result="I'll look into the repo now.",
+                    is_error=True,
+                    errors=["boom"],
+                ),
+            ]
+        ]
+    )
+    result, _messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 1
+    assert result["completed"] is False
+
+
+def test_multimodal_user_input_never_re_queries():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    session = _MultiCallSession([_ACK_SCRIPT])
+    result, _messages = _run_turn_multi(
+        agent,
+        session,
+        user_message=[{"type": "text", "text": "hi"}],
+        original_user_message=[{"type": "text", "text": "hi"}],
+    )
+
+    assert session.calls == 1
+    assert result["api_calls"] == 1
+
+
+def test_a_continuation_failure_falls_back_to_the_prior_attempts_result():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    agent._claude_session = session = _MultiCallSession(
+        [_ACK_SCRIPT], raises_on={1: RuntimeError("boom")}
+    )
+    result, messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 2
+    assert session.closed is True
+    assert getattr(agent, "_claude_session", None) is None
+    assert result["completed"] is True
+    assert result["api_calls"] == 1
+    assert result["final_response"] == "I'll look into the repo now."
+    assert not any(
+        m.get("role") == "user" and m.get("content") == claude_runtime._ACK_CONTINUE_TEXT
+        for m in messages
+    )
+
+
+def test_require_workspace_is_false_when_opted_in_for_all_api_modes():
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    captured = {}
+    original = agent._looks_like_codex_intermediate_ack
+
+    def _spy(**kwargs):
+        captured.update(kwargs)
+        return original(**kwargs)
+
+    agent._looks_like_codex_intermediate_ack = _spy
+    session = _MultiCallSession(
+        [
+            _ACK_SCRIPT,
+            [AssistantMessage(content=[TextBlock("done")]), ResultMessage(result="done")],
+        ]
+    )
+    _run_turn_multi(agent, session)
+
+    assert captured["require_workspace"] is False

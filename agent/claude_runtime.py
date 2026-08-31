@@ -1783,6 +1783,134 @@ def _attach_leftover_steer(agent, result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+# Codex's loop caps intent-ack re-queries at 2 (conversation_loop.py's
+# `codex_ack_continuations < 2`) — the SDK path mirrors that cap exactly so
+# a model that keeps re-announcing intent can't turn one turn into an
+# unbounded chain of `run_turn` calls against the live subscription CLI.
+MAX_ACK_CONTINUATIONS = 2
+
+# Byte-identical to conversation_loop.py's continuation prompt so the model
+# sees the same nudge regardless of which runtime is driving the turn.
+_ACK_CONTINUE_TEXT = (
+    "[System: Continue now. Execute the required tool calls and only "
+    "send your final answer after completing the task.]"
+)
+
+
+def _ack_continuation_enabled_for_sdk() -> bool:
+    """The user's `claude_subscription.ack_continuation` kill switch.
+
+    Independent of (and layered on top of) `intent_ack_continuation_mode` —
+    that function decides whether ack-continuation applies to this api_mode
+    at all; this is an SDK-path-specific opt-out for operators who want
+    Codex-style ack-continuation everywhere except the subscription runtime.
+    Degrades to enabled (the default) on any missing/unreadable config, the
+    same tolerance `_configured_stall_timeout` uses.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        logger.debug("claude ack_continuation config load failed", exc_info=True)
+        return True
+    section = config.get("claude_subscription") if isinstance(config, dict) else None
+    if not isinstance(section, dict) or "ack_continuation" not in section:
+        return True
+    raw = section["ack_continuation"]
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"false", "off", "no", "0"}
+    if isinstance(raw, (bool, int, float)):
+        return bool(raw)
+    return True
+
+
+def _record_claude_attempt(
+    agent,
+    messages: List[Dict[str, Any]],
+    session: Any,
+    projector: "ClaudeEventProjector",
+    turn_error: Optional[str],
+    should_retire: bool,
+    *,
+    bind_session: bool,
+    cwd: Optional[str] = None,
+    user_ordinal: Optional[int] = None,
+    watermark: Any = None,
+) -> Dict[str, Any]:
+    """Finalize one SDK ``run_turn`` call: persist projected messages, bind or
+    retire the session, and roll usage/compaction bookkeeping.
+
+    Shared by the original attempt and any ack-continuation re-query so every
+    ``run_turn`` against the same session gets identical accounting —
+    ``record_claude_session_binding`` is the one exception, gated by
+    ``bind_session`` since it is attempt-1-only (same ``user_ordinal``
+    semantics as before continuation existed).
+    """
+    projected = projector.finalize()
+    if projector.session_id:
+        session.note_session_id(projector.session_id)
+        if bind_session:
+            record_claude_session_binding(
+                agent,
+                projector,
+                cwd=cwd,
+                user_ordinal=user_ordinal,
+                watermark=watermark,
+            )
+    if turn_error is None and projector.error:
+        turn_error = projector.error
+
+    # A wedged or crashed client must not be reused: the next turn respawns
+    # the CLI from scratch rather than riding a broken subprocess.
+    if should_retire:
+        _retire_session(agent)
+
+    user_interrupted = bool(getattr(agent, "_interrupt_requested", False))
+    interrupt_message = (
+        getattr(agent, "_interrupt_message", None) if user_interrupted else None
+    )
+    if user_interrupted:
+        agent.clear_interrupt()
+
+    if projected:
+        messages.extend(projected)
+        # This path is an early return that bypasses conversation_loop, whose
+        # per-step _persist_session() calls would otherwise flush these rows.
+        # The inbound user turn was already flushed at turn start and the
+        # flush dedups via _DB_PERSISTED_MARKER, so this writes ONLY the new
+        # rows — which is what lets us report agent_persisted=True below and
+        # keep the gateway from re-INSERTing the user turn (#860 / #42039).
+        if getattr(agent, "_session_db", None) is not None:
+            try:
+                flushed = agent._flush_messages_to_session_db(messages)
+            except Exception:
+                flushed = False
+                logger.warning(
+                    "claude_agent_sdk projected-message flush failed", exc_info=True
+                )
+            if flushed is False:
+                logger.warning(
+                    "claude_agent_sdk turn was delivered but could NOT be "
+                    "persisted to the session DB (session=%s) — this turn "
+                    "will be missing after restart/resume",
+                    getattr(agent, "session_id", None),
+                )
+
+    agent._iters_since_skill = (
+        getattr(agent, "_iters_since_skill", 0) + projector.tool_iterations
+    )
+    record_claude_compaction(agent, projector)
+    usage_result = record_claude_usage(agent, projector)
+
+    return {
+        "turn_error": turn_error,
+        "user_interrupted": user_interrupted,
+        "interrupt_message": interrupt_message,
+        "usage_result": usage_result,
+    }
+
+
 def _failure_result(
     agent,
     messages: List[Dict[str, Any]],
@@ -1942,63 +2070,100 @@ def run_claude_agent_sdk_turn(
             logger.exception("claude_agent_sdk turn failed")
         break
 
-    projected = projector.finalize()
-    if projector.session_id:
-        session.note_session_id(projector.session_id)
-        record_claude_session_binding(
-            agent,
-            projector,
-            cwd=cwd,
-            user_ordinal=user_ordinal,
-            watermark=watermark,
+    attempt_record = _record_claude_attempt(
+        agent,
+        messages,
+        session,
+        projector,
+        turn_error,
+        should_retire,
+        bind_session=True,
+        cwd=cwd,
+        user_ordinal=user_ordinal,
+        watermark=watermark,
+    )
+    turn_error = attempt_record["turn_error"]
+    user_interrupted = attempt_record["user_interrupted"]
+    interrupt_message = attempt_record["interrupt_message"]
+    usage_result = attempt_record["usage_result"]
+
+    api_calls = 1
+    final_text = projector.final_text
+    completed = turn_error is None and not user_interrupted and not projector.is_error
+
+    # Intent-ack continuation: a turn that only announces a plan ("I'll look
+    # into X...") and never acts gets re-queried against the SAME SDK
+    # session, mirroring the codex loop's ack-continuation
+    # (conversation_loop.py's `codex_ack_continuations < 2`). Every gate here
+    # must hold before spending another `run_turn` — most turns never reach
+    # this loop body at all.
+    while (
+        completed
+        and final_text
+        and isinstance(user_message, str)
+        and api_calls <= MAX_ACK_CONTINUATIONS
+        and _ack_continuation_enabled_for_sdk()
+    ):
+        from agent.agent_runtime_helpers import intent_ack_continuation_mode
+
+        ack_mode = intent_ack_continuation_mode(agent)
+        if (
+            ack_mode == "off"
+            or not agent.valid_tool_names
+            or not agent._looks_like_codex_intermediate_ack(
+                user_message=user_message,
+                assistant_content=final_text,
+                messages=messages,
+                require_workspace=(ack_mode != "all"),
+            )
+        ):
+            break
+
+        agent._emit_interim_assistant_message(
+            {"role": "assistant", "content": final_text}
         )
-    if turn_error is None and projector.error:
-        turn_error = projector.error
+        messages.append({"role": "user", "content": _ACK_CONTINUE_TEXT})
 
-    # A wedged or crashed client must not be reused: the next turn respawns
-    # the CLI from scratch rather than riding a broken subprocess.
-    if should_retire:
-        _retire_session(agent)
+        continuation_projector = make_claude_event_projector(agent)
+        try:
+            session.run_turn(
+                _ACK_CONTINUE_TEXT,
+                on_message=continuation_projector,
+                timeout=DEFAULT_TURN_TIMEOUT_SECONDS,
+                stall_timeout=_configured_stall_timeout(),
+                stall_exempt=lambda: getattr(agent, "_claude_bridge_inflight", 0) > 0,
+            )
+        except Exception as exc:
+            # No stale-session recovery here — a continuation is an optional
+            # extra pass on top of an already-successful turn 1, so on
+            # failure we drop the dangling continuation prompt and report
+            # attempt 1's result rather than failing the whole turn.
+            messages.pop()
+            logger.warning(
+                "claude_agent_sdk ack-continuation run_turn failed: %s", exc
+            )
+            _retire_session(agent)
+            break
 
-    user_interrupted = bool(getattr(agent, "_interrupt_requested", False))
-    interrupt_message = (
-        getattr(agent, "_interrupt_message", None) if user_interrupted else None
-    )
-    if user_interrupted:
-        agent.clear_interrupt()
-
-    if projected:
-        messages.extend(projected)
-        # This path is an early return that bypasses conversation_loop, whose
-        # per-step _persist_session() calls would otherwise flush these rows.
-        # The inbound user turn was already flushed at turn start and the
-        # flush dedups via _DB_PERSISTED_MARKER, so this writes ONLY the new
-        # rows — which is what lets us report agent_persisted=True below and
-        # keep the gateway from re-INSERTing the user turn (#860 / #42039).
-        if getattr(agent, "_session_db", None) is not None:
-            try:
-                flushed = agent._flush_messages_to_session_db(messages)
-            except Exception:
-                flushed = False
-                logger.warning(
-                    "claude_agent_sdk projected-message flush failed", exc_info=True
-                )
-            if flushed is False:
-                logger.warning(
-                    "claude_agent_sdk turn was delivered but could NOT be "
-                    "persisted to the session DB (session=%s) — this turn "
-                    "will be missing after restart/resume",
-                    getattr(agent, "session_id", None),
-                )
-
-    # _turns_since_memory / _user_turn_count are already incremented in the
-    # run_conversation() pre-loop block; only the skill counter needs an
-    # explicit bump because the tool-iteration loop is bypassed here.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + projector.tool_iterations
-    )
-    record_claude_compaction(agent, projector)
-    usage_result = record_claude_usage(agent, projector)
+        projector = continuation_projector
+        api_calls += 1
+        attempt_record = _record_claude_attempt(
+            agent,
+            messages,
+            session,
+            projector,
+            None,
+            False,
+            bind_session=False,
+        )
+        turn_error = attempt_record["turn_error"]
+        user_interrupted = attempt_record["user_interrupted"]
+        interrupt_message = attempt_record["interrupt_message"]
+        usage_result = attempt_record["usage_result"]
+        final_text = projector.final_text
+        completed = (
+            turn_error is None and not user_interrupted and not projector.is_error
+        )
 
     should_review_skills = False
     if (
@@ -2008,9 +2173,6 @@ def run_claude_agent_sdk_turn(
     ):
         should_review_skills = True
         agent._iters_since_skill = 0
-
-    final_text = projector.final_text
-    completed = turn_error is None and not user_interrupted and not projector.is_error
 
     if completed:
         try:
@@ -2039,7 +2201,7 @@ def run_claude_agent_sdk_turn(
     return _attach_leftover_steer(agent, {
         "final_response": final_text,
         "messages": messages,
-        "api_calls": 1,
+        "api_calls": api_calls,
         "completed": completed,
         "partial": not completed,
         "interrupted": user_interrupted,
