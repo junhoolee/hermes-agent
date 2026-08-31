@@ -218,7 +218,9 @@ class _StubSession:
         self.closed = False
         self.prompts: list[str] = []
 
-    def run_turn(self, prompt, *, on_message, timeout=None):
+    def run_turn(
+        self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None
+    ):
         self.prompts.append(prompt)
         if self.fail_once is not None:
             failure, self.fail_once = self.fail_once, None
@@ -657,7 +659,9 @@ def test_recovery_does_not_loop_when_the_fresh_session_also_fails(db):
     db.bind_provider_runtime_session(HERMES_SESSION, RUNTIME, "sdk-gone")
 
     class _AlwaysFails(_StubSession):
-        def run_turn(self, prompt, *, on_message, timeout=None):
+        def run_turn(
+            self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None
+        ):
             self.prompts.append(prompt)
             raise RuntimeError("No conversation found")
 

@@ -262,12 +262,22 @@ class ClaudeAgentSession:
         *,
         on_message: Callable[[Any], None],
         timeout: Optional[float] = None,
+        stall_timeout: Optional[float] = None,
+        stall_exempt: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Send *prompt* and block until the response stream goes quiet.
 
         ``on_message`` is invoked once per SDK message, in arrival order, on
         the **calling** thread — Hermes' display/tool callbacks are
         thread-affine and must not run on the SDK's event loop.
+
+        ``stall_timeout``, when set, raises ``TimeoutError`` if no SDK
+        message arrives for that many seconds — a much tighter bound than
+        the overall turn deadline, meant to catch a silently wedged CLI
+        instead of waiting out the full ``timeout``.  ``None`` (the default)
+        disables it.  ``stall_exempt``, if given, is polled on every idle
+        tick; while it returns True the stall clock is held off (a long
+        bridged tool call legitimately produces no SDK messages).
 
         Returns the number of messages delivered.  Raises ``TimeoutError``
         when the turn blows its deadline (the caller should retire the
@@ -281,6 +291,7 @@ class ClaudeAgentSession:
         self._turn_count += 1
 
         deadline = time.monotonic() + (timeout or self._turn_timeout)
+        last_activity = time.monotonic()
         delivered = 0
         try:
             while True:
@@ -293,7 +304,17 @@ class ClaudeAgentSession:
                 try:
                     kind, payload = inbox.get(timeout=min(remaining, 0.25))
                 except queue.Empty:
+                    if stall_timeout is not None:
+                        now = time.monotonic()
+                        if stall_exempt is not None and stall_exempt():
+                            last_activity = now
+                        elif now - last_activity > stall_timeout:
+                            raise TimeoutError(
+                                "Claude Agent SDK turn received no SDK "
+                                f"messages for {stall_timeout:.0f}s (stalled)."
+                            )
                     continue
+                last_activity = time.monotonic()
                 if kind == "message":
                     delivered += 1
                     on_message(payload)

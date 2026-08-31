@@ -795,9 +795,15 @@ class _StubSession:
         self.closed = False
         self.prompts = []
         self.session_ids = []
+        self.last_stall_timeout = "unset"
+        self.last_stall_exempt = None
 
-    def run_turn(self, prompt, *, on_message, timeout=None):
+    def run_turn(
+        self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None
+    ):
         self.prompts.append(prompt)
+        self.last_stall_timeout = stall_timeout
+        self.last_stall_exempt = stall_exempt
         if self.raises is not None:
             raise self.raises
         for message in self.script:
@@ -1027,6 +1033,66 @@ def test_start_timeout_ignores_a_malformed_config_value(monkeypatch):
         {"claude_subscription": {"enabled": True, "start_timeout": "soon"}},
     )
     assert "start_timeout" not in kwargs
+
+
+# ---------------------------------------------------------------------------
+# Stall watchdog wiring
+# ---------------------------------------------------------------------------
+
+
+def test_stall_timeout_defaults_to_300_seconds_when_not_configured():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True}},
+    ):
+        assert claude_runtime._configured_stall_timeout() == 300.0
+
+
+def test_stall_timeout_follows_claude_subscription_config():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True, "stall_timeout": 90}},
+    ):
+        assert claude_runtime._configured_stall_timeout() == 90.0
+
+
+def test_stall_timeout_zero_disables_the_watchdog():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True, "stall_timeout": 0}},
+    ):
+        assert claude_runtime._configured_stall_timeout() is None
+
+
+def test_stall_timeout_ignores_a_malformed_config_value():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True, "stall_timeout": "soon"}},
+    ):
+        assert claude_runtime._configured_stall_timeout() == 300.0
+
+
+def test_stall_timeout_falls_back_to_the_default_when_config_load_fails():
+    with patch(
+        "hermes_cli.config.load_config_readonly", side_effect=RuntimeError("boom")
+    ):
+        assert claude_runtime._configured_stall_timeout() == 300.0
+
+
+def test_run_turn_receives_the_configured_stall_timeout_and_bridge_exempt():
+    agent = _make_agent("web_search")
+    session = _StubSession([ResultMessage(result="hi")])
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True, "stall_timeout": 45}},
+    ):
+        _run_turn(agent, session)
+
+    assert session.last_stall_timeout == 45.0
+    assert callable(session.last_stall_exempt)
+    assert session.last_stall_exempt() is False
+    agent._claude_bridge_inflight = 1
+    assert session.last_stall_exempt() is True
 
 
 # ---------------------------------------------------------------------------
