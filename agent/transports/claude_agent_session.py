@@ -240,6 +240,30 @@ class ClaudeAgentSession:
             logger.debug("claude_agent_sdk interrupt failed", exc_info=True)
             return False
 
+    def request_interrupt_nowait(self) -> bool:
+        """Fire-and-forget variant of ``request_interrupt``. Never raises.
+
+        For callers running on ``run_turn``'s own drain thread (e.g. an
+        ``on_message`` callback) — ``request_interrupt`` blocks that thread
+        for up to ``DEFAULT_CONTROL_TIMEOUT_SECONDS`` via ``_submit``'s
+        ``future.result(timeout=...)``, which would stall drain and delay
+        delivery of the very ``ResultMessage`` the interrupt is meant to
+        produce. This submits the coroutine without waiting for it; the
+        existing drain loop picks up its effect (the interrupted
+        ``ResultMessage``) the normal way.
+        """
+        client = self._client
+        if client is None or self._closed:
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(client.interrupt(), self._require_loop())
+            return True
+        except Exception:
+            logger.debug(
+                "claude_agent_sdk interrupt (nowait) failed", exc_info=True
+            )
+            return False
+
     def set_model(self, model: Optional[str]) -> bool:
         """Switch the model for subsequent turns. Never raises."""
         client = self._client

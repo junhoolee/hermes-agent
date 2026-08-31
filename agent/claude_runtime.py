@@ -881,10 +881,32 @@ class ClaudeEventProjector:
     when trailing events arrive after ``ResultMessage``.
     """
 
-    def __init__(self, agent) -> None:
+    def __init__(
+        self, agent, *, max_internal_iterations: Optional[int] = None
+    ) -> None:
         self._agent = agent
         self.projected_messages: List[Dict[str, Any]] = []
         self.tool_iterations = 0
+        # One internal loop step = one AssistantMessage (the SDK's own
+        # agentic loop can run several before returning from a single
+        # `run_turn`, invisible to Hermes otherwise). Counted separately from
+        # `tool_iterations` (which counts individual tool calls) so the
+        # `agent:step` hook payload matches the classic loop's `api_call_count`
+        # semantics exactly.
+        self.iteration_count = 0
+        self.max_internal_iterations = max_internal_iterations
+        self.iteration_cap_exceeded = False
+        # Bound by the caller to `session.request_interrupt_nowait` once the
+        # session exists (unavailable at construction time) — must be the
+        # nowait variant since this fires on run_turn's own drain thread.
+        # Left None in contexts — like the test suite's bare projector —
+        # that never wire it up.
+        self.request_interrupt: Optional[Callable[[], bool]] = None
+        self._cap_interrupt_sent = False
+        # Snapshot of the most recently flushed tool round, for
+        # `_prev_iteration_tools` — see that method for why this can't just
+        # read `_pending_calls`/`_pending_results` directly.
+        self._last_completed_tools: List[Dict[str, Any]] = []
         self.session_id: Optional[str] = None
         self.terminal_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
@@ -997,8 +1019,75 @@ class ClaudeEventProjector:
                 self._streamed_thinking = True
                 self._fire("_fire_reasoning_delta", thinking)
 
+    def _prev_iteration_tools(self) -> List[Dict[str, Any]]:
+        """Tool calls (with results) dispatched in the previous iteration.
+
+        Mirrors the classic loop's ``prev_tools`` payload for the
+        ``agent:step`` hook, so a gateway hook author gets the same shape
+        (``name``/``arguments``/``result``) regardless of which runtime drove
+        the turn. Reads (and clears) ``_last_completed_tools`` rather than
+        ``_pending_calls`` directly: by the time the *next* AssistantMessage
+        arrives, the matching ``UserMessage`` has usually already flushed and
+        cleared the pending call/result pair.  Consumed exactly once per
+        iteration so a tool-less iteration doesn't leak a stale answer two
+        steps forward.
+        """
+        tools = self._last_completed_tools
+        self._last_completed_tools = []
+        return tools
+
+    def _check_iteration_cap(self) -> None:
+        """Interrupt the turn once the opt-in internal-iteration cap is hit.
+
+        Uses the SDK's own graceful interrupt
+        (:meth:`ClaudeAgentSession.request_interrupt_nowait`) rather than
+        raising: the CLI aborts the in-flight call on its own schedule and
+        ``run_turn``'s existing drain loop delivers the resulting
+        ``ResultMessage`` normally, so the turn ends cleanly and the session
+        needs no retirement — unlike the stall watchdog's ``TimeoutError``,
+        which forces the caller to respawn the CLI. The *nowait* variant is
+        required, not just preferred: this fires from ``_on_assistant``,
+        which ``on_message`` runs on ``run_turn``'s own drain thread, so the
+        blocking ``request_interrupt`` would stall drain (and delay the very
+        ``ResultMessage`` this is trying to produce) for up to its own
+        control timeout. Fires at most once per turn: further
+        AssistantMessages may still land while the CLI winds down, and each
+        one must not re-request an interrupt that already went out.
+        """
+        if (
+            self.max_internal_iterations is None
+            or self._cap_interrupt_sent
+            or self.iteration_count <= self.max_internal_iterations
+        ):
+            return
+        self._cap_interrupt_sent = True
+        self.iteration_cap_exceeded = True
+        logger.info(
+            "claude_agent_sdk internal iteration cap (%s) reached at "
+            "iteration %s; requesting a graceful interrupt to end the turn",
+            self.max_internal_iterations,
+            self.iteration_count,
+        )
+        self._fire(
+            "_emit_status",
+            "Claude reached its internal iteration cap "
+            f"({self.max_internal_iterations}) for this turn; wrapping up.",
+        )
+        request_interrupt = self.request_interrupt
+        if callable(request_interrupt):
+            try:
+                request_interrupt()
+            except Exception:
+                logger.debug(
+                    "claude_agent_sdk iteration-cap interrupt failed",
+                    exc_info=True,
+                )
+
     def _on_assistant(self, message: Any) -> None:
         self._note_session_id(getattr(message, "session_id", None))
+        self.iteration_count += 1
+        self._fire("step_callback", self.iteration_count, self._prev_iteration_tools())
+        self._check_iteration_cap()
         usage = getattr(message, "usage", None)
         if isinstance(usage, dict) and usage:
             self.last_call_usage = usage
@@ -1221,6 +1310,14 @@ class ClaudeEventProjector:
         """
         if not self._pending_calls:
             return
+        self._last_completed_tools = [
+            {
+                "name": display_tool_name(call["name"]),
+                "arguments": call["input"],
+                "result": self._pending_results.get(call["id"]),
+            }
+            for call in self._pending_calls
+        ]
         for call in self._pending_calls:
             content = self._pending_results.get(call["id"])
             if content is None:
@@ -1277,9 +1374,11 @@ def _dump_args(args: Any) -> str:
         return json.dumps({"_raw": str(args)}, ensure_ascii=False)
 
 
-def make_claude_event_projector(agent) -> ClaudeEventProjector:
+def make_claude_event_projector(
+    agent, *, max_internal_iterations: Optional[int] = None
+) -> ClaudeEventProjector:
     """Build the per-turn projector bound to *agent*."""
-    return ClaudeEventProjector(agent)
+    return ClaudeEventProjector(agent, max_internal_iterations=max_internal_iterations)
 
 
 # ---------------------------------------------------------------------------
@@ -1580,6 +1679,40 @@ def _configured_stall_timeout() -> Optional[float]:
     if value == 0:
         return None
     return value if value > 0 else DEFAULT_STALL_TIMEOUT_SECONDS
+
+
+def _configured_max_internal_iterations() -> Optional[int]:
+    """The user's `claude_subscription.max_internal_iterations`, or None.
+
+    Opt-in, unlike `_configured_stall_timeout`: a wedged CLI is a failure
+    mode that always benefits from a protective default, but the SDK's
+    internal agentic loop has no such universal ceiling — a legitimately
+    tool-heavy turn may need many rounds, and capping it by default would
+    truncate work the user asked for. None (unset) means "no cap", the same
+    as it did before this feature existed. An operator who wants a hard
+    ceiling on one turn's internal iterations opts in explicitly; anything
+    missing, non-numeric, or <= 0 also reads as "no cap".
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        logger.debug(
+            "claude max_internal_iterations config load failed", exc_info=True
+        )
+        return None
+    section = config.get("claude_subscription") if isinstance(config, dict) else None
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("max_internal_iterations")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _ensure_session(agent, effective_task_id: str) -> Any:
@@ -1997,7 +2130,10 @@ def run_claude_agent_sdk_turn(
         - 1
     )
 
-    projector = make_claude_event_projector(agent)
+    max_internal_iterations = _configured_max_internal_iterations()
+    projector = make_claude_event_projector(
+        agent, max_internal_iterations=max_internal_iterations
+    )
     turn_error: Optional[str] = None
     should_retire = False
     attempted_recovery = False
@@ -2040,6 +2176,14 @@ def run_claude_agent_sdk_turn(
                 agent, messages, final_response=detail, error=str(exc)
             )
 
+        # Unavailable at projector-construction time (the session may not
+        # exist yet on the first pass); wired here so the projector's cap
+        # check can request a graceful interrupt through the session that
+        # will actually run this turn. Must be the nowait variant — the cap
+        # check fires from _on_assistant, which on_message runs on run_turn's
+        # own drain thread; the blocking request_interrupt would stall drain.
+        projector.request_interrupt = session.request_interrupt_nowait
+
         watermark = _mirror_watermark(agent, sdk_state.get("resume"))
         turn_error = None
         try:
@@ -2062,7 +2206,9 @@ def run_claude_agent_sdk_turn(
             ):
                 attempted_recovery = True
                 should_retire = False
-                projector = make_claude_event_projector(agent)
+                projector = make_claude_event_projector(
+                    agent, max_internal_iterations=max_internal_iterations
+                )
                 prompt = _recover_stale_session(
                     agent, sdk_state, messages, user_message
                 )
@@ -2089,16 +2235,27 @@ def run_claude_agent_sdk_turn(
 
     api_calls = 1
     final_text = projector.final_text
-    completed = turn_error is None and not user_interrupted and not projector.is_error
+    # A cap-triggered interrupt produces a ResultMessage that the SDK may
+    # itself flag as an error/aborted call; that is not a real turn failure
+    # (the interrupt was requested by Hermes, not the CLI choking), so
+    # is_error is ignored — not ANDed in — whenever the cap fired.
+    completed = (
+        turn_error is None
+        and not user_interrupted
+        and (not projector.is_error or projector.iteration_cap_exceeded)
+    )
 
     # Intent-ack continuation: a turn that only announces a plan ("I'll look
     # into X...") and never acts gets re-queried against the SAME SDK
     # session, mirroring the codex loop's ack-continuation
     # (conversation_loop.py's `codex_ack_continuations < 2`). Every gate here
     # must hold before spending another `run_turn` — most turns never reach
-    # this loop body at all.
+    # this loop body at all. A capped attempt is excluded on its own terms
+    # (independent of `completed`, which the cap no longer forces false):
+    # re-querying would only burn another `run_turn` against the same cap.
     while (
         completed
+        and not projector.iteration_cap_exceeded
         and final_text
         and isinstance(user_message, str)
         and api_calls <= MAX_ACK_CONTINUATIONS
@@ -2124,7 +2281,10 @@ def run_claude_agent_sdk_turn(
         )
         messages.append({"role": "user", "content": _ACK_CONTINUE_TEXT})
 
-        continuation_projector = make_claude_event_projector(agent)
+        continuation_projector = make_claude_event_projector(
+            agent, max_internal_iterations=max_internal_iterations
+        )
+        continuation_projector.request_interrupt = session.request_interrupt_nowait
         try:
             session.run_turn(
                 _ACK_CONTINUE_TEXT,
@@ -2162,7 +2322,9 @@ def run_claude_agent_sdk_turn(
         usage_result = attempt_record["usage_result"]
         final_text = projector.final_text
         completed = (
-            turn_error is None and not user_interrupted and not projector.is_error
+            turn_error is None
+            and not user_interrupted
+            and (not projector.is_error or projector.iteration_cap_exceeded)
         )
 
     should_review_skills = False
@@ -2198,6 +2360,14 @@ def run_claude_agent_sdk_turn(
     if turn_error and not final_text:
         final_text = f"Claude Agent SDK turn failed: {turn_error}"
 
+    if projector.iteration_cap_exceeded:
+        cap_notice = (
+            "[Claude Agent SDK reached its internal iteration cap "
+            f"({projector.max_internal_iterations}) for this turn and "
+            "stopped.]"
+        )
+        final_text = f"{final_text}\n\n{cap_notice}" if final_text else cap_notice
+
     return _attach_leftover_steer(agent, {
         "final_response": final_text,
         "messages": messages,
@@ -2206,6 +2376,11 @@ def run_claude_agent_sdk_turn(
         "partial": not completed,
         "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
+        **(
+            {"claude_iteration_cap_exceeded": True}
+            if projector.iteration_cap_exceeded
+            else {}
+        ),
         "error": turn_error,
         "agent_persisted": True,
         "claude_session_id": projector.session_id,
