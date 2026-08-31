@@ -367,6 +367,66 @@ def test_run_bridged_tool_inflight_counts_concurrent_calls(sdk_module):
 
 
 # ---------------------------------------------------------------------------
+# /steer delivery: run_bridged_tool appends any pending steer to its response
+# ---------------------------------------------------------------------------
+
+
+def test_run_bridged_tool_appends_pending_steer_to_response(sdk_module):
+    agent = _make_agent("web_search")
+    agent._pending_steer = "focus on the auth module instead"
+
+    with (
+        patch.object(bridge, "execute_one_tool", side_effect=lambda a, tc, tid, **kw: _fake_outcome(tc)),
+        patch.object(bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result),
+    ):
+        response = bridge.run_bridged_tool(agent, "web_search", {"query": "x"}, "task-1")
+
+    assert agent._pending_steer is None
+    texts = [block["text"] for block in response["content"] if block.get("type") == "text"]
+    assert any("focus on the auth module instead" in text for text in texts)
+    from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+
+    assert any(STEER_MARKER_OPEN in text and STEER_MARKER_CLOSE in text for text in texts)
+
+
+def test_run_bridged_tool_leaves_response_alone_without_pending_steer(sdk_module):
+    agent = _make_agent("web_search")
+    assert getattr(agent, "_pending_steer", None) is None
+
+    with (
+        patch.object(bridge, "execute_one_tool", side_effect=lambda a, tc, tid, **kw: _fake_outcome(tc)),
+        patch.object(bridge, "finalize_tool_outcome", side_effect=lambda a, o: o.result),
+    ):
+        response = bridge.run_bridged_tool(agent, "web_search", {"query": "x"}, "task-1")
+
+    assert len(response["content"]) == 1
+
+
+def test_append_pending_steer_appends_marker_text_block():
+    def _drain():
+        agent._pending_steer, drained = None, agent._pending_steer
+        return drained
+
+    agent = SimpleNamespace(_pending_steer="stop and check the tests first", _drain_pending_steer=_drain)
+
+    response = bridge._append_pending_steer(agent, {"content": [{"type": "text", "text": "tool ran"}]})
+
+    assert agent._pending_steer is None
+    assert len(response["content"]) == 2
+    assert "stop and check the tests first" in response["content"][1]["text"]
+
+
+def test_append_pending_steer_is_a_noop_when_nothing_pending():
+    agent = SimpleNamespace(_drain_pending_steer=lambda: None)
+    response = {"content": [{"type": "text", "text": "tool ran"}]}
+
+    result = bridge._append_pending_steer(agent, response)
+
+    assert result is response
+    assert len(result["content"]) == 1
+
+
+# ---------------------------------------------------------------------------
 # Approval context on the SDK loop thread
 # ---------------------------------------------------------------------------
 

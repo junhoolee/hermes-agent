@@ -305,6 +305,32 @@ def test_preflight_names_the_login_command_when_signed_out():
     assert "claude auth login" in message
 
 
+def test_failure_result_attaches_leftover_pending_steer():
+    """A /steer sent right before a refused/failed turn (preflight gate,
+    billing refusal, session-construction failure) must still surface —
+    _failure_result is the early-return path run_claude_agent_sdk_turn
+    takes before any bridged tool call could have delivered it."""
+    agent = _make_agent("web_search")
+    agent._pending_steer = "wait, use the other branch"
+
+    result = claude_runtime._failure_result(
+        agent, [], final_response="refused", error="refused"
+    )
+
+    assert result["pending_steer"] == "wait, use the other branch"
+    assert agent._pending_steer is None
+
+
+def test_failure_result_omits_pending_steer_key_when_none_pending():
+    agent = _make_agent("web_search")
+
+    result = claude_runtime._failure_result(
+        agent, [], final_response="refused", error="refused"
+    )
+
+    assert "pending_steer" not in result
+
+
 def test_preflight_passes_when_all_three_gates_are_open():
     with (
         patch(
@@ -860,6 +886,30 @@ def test_a_completed_turn_returns_the_run_conversation_shape():
     assert result["agent_persisted"] is True
     assert result["claude_session_id"] == "sdk-session-1"
     assert result["prompt_tokens"] >= 12
+
+
+def test_leftover_pending_steer_is_attached_to_the_completed_turn_result():
+    """A /steer that arrives after the last bridged tool call (or with no
+    tool calls at all) must not be silently dropped — it rides back on the
+    turn result so the caller can requeue it as the next user turn, the same
+    contract chat_completions' turn_finalizer already honors."""
+    agent = _make_agent("web_search")
+    agent._pending_steer = "actually check the tests too"
+    session = _StubSession([AssistantMessage(content=[TextBlock("hello")]), ResultMessage(result="hello")])
+
+    result, _messages = _run_turn(agent, session)
+
+    assert result["pending_steer"] == "actually check the tests too"
+    assert agent._pending_steer is None
+
+
+def test_a_completed_turn_with_no_pending_steer_omits_the_key():
+    agent = _make_agent("web_search")
+    session = _StubSession([AssistantMessage(content=[TextBlock("hello")]), ResultMessage(result="hello")])
+
+    result, _messages = _run_turn(agent, session)
+
+    assert "pending_steer" not in result
 
 
 def test_projected_messages_are_spliced_exactly_once_including_trailing_events():
