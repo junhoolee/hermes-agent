@@ -823,6 +823,8 @@ class _StubSession:
         self.session_ids = []
         self.last_stall_timeout = "unset"
         self.last_stall_exempt = None
+        self.interrupt_requests = 0
+        self.nowait_interrupt_requests = 0
 
     def run_turn(
         self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None
@@ -838,6 +840,14 @@ class _StubSession:
 
     def note_session_id(self, session_id):
         self.session_ids.append(session_id)
+
+    def request_interrupt(self):
+        self.interrupt_requests += 1
+        return True
+
+    def request_interrupt_nowait(self):
+        self.nowait_interrupt_requests += 1
+        return True
 
     def close(self):
         self.closed = True
@@ -1231,6 +1241,203 @@ def test_last_prompt_tokens_falls_back_to_cumulative_without_per_call_usage():
 
 
 # ---------------------------------------------------------------------------
+# Internal iteration cap (opt-in) + graceful interrupt to end the turn
+# ---------------------------------------------------------------------------
+
+
+def test_max_internal_iterations_defaults_to_unlimited_when_not_configured():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True}},
+    ):
+        assert claude_runtime._configured_max_internal_iterations() is None
+
+
+def test_max_internal_iterations_follows_claude_subscription_config():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "claude_subscription": {"enabled": True, "max_internal_iterations": 3}
+        },
+    ):
+        assert claude_runtime._configured_max_internal_iterations() == 3
+
+
+@pytest.mark.parametrize("raw", ["soon", 0, -1, True])
+def test_max_internal_iterations_ignores_a_malformed_or_non_positive_value(raw):
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "claude_subscription": {"enabled": True, "max_internal_iterations": raw}
+        },
+    ):
+        assert claude_runtime._configured_max_internal_iterations() is None
+
+
+def test_max_internal_iterations_falls_back_to_unlimited_when_config_load_fails():
+    with patch(
+        "hermes_cli.config.load_config_readonly", side_effect=RuntimeError("boom")
+    ):
+        assert claude_runtime._configured_max_internal_iterations() is None
+
+
+def test_each_assistant_message_fires_the_step_callback_once():
+    agent = _make_agent("web_search")
+    steps = []
+    agent.step_callback = lambda iteration, prev_tools: steps.append(
+        (iteration, prev_tools)
+    )
+    projector = ClaudeEventProjector(agent)
+
+    projector(
+        AssistantMessage(
+            content=[ToolUseBlock("t1", "mcp__hermes__web_search", {"query": "a"})]
+        )
+    )
+    projector(UserMessage(content=[ToolResultBlock("t1", "results")]))
+    projector(AssistantMessage(content=[TextBlock("done")]))
+    projector(ResultMessage(result="done"))
+
+    assert [step[0] for step in steps] == [1, 2]
+    # The first step has no prior iteration to report.
+    assert steps[0][1] == []
+    # The second step reports the first iteration's tool call, with its result.
+    assert steps[1][1] == [
+        {"name": "web_search", "arguments": {"query": "a"}, "result": "results"}
+    ]
+
+
+def test_iteration_count_stays_at_zero_without_any_assistant_message():
+    agent = _make_agent("web_search")
+    projector = ClaudeEventProjector(agent)
+    projector(ResultMessage(result="hi"))
+    assert projector.iteration_count == 0
+    assert projector.iteration_cap_exceeded is False
+
+
+def test_uncapped_projector_never_requests_an_interrupt():
+    agent = _make_agent("web_search")
+    projector = ClaudeEventProjector(agent)
+    calls = []
+    projector.request_interrupt = lambda: calls.append(1) or True
+    for _ in range(10):
+        projector(AssistantMessage(content=[TextBlock("hi")]))
+    assert calls == []
+    assert projector.iteration_cap_exceeded is False
+
+
+def test_a_capped_projector_requests_exactly_one_interrupt_once_exceeded():
+    agent = _make_agent("web_search")
+    projector = ClaudeEventProjector(agent, max_internal_iterations=2)
+    calls = []
+    projector.request_interrupt = lambda: calls.append(1) or True
+
+    projector(AssistantMessage(content=[TextBlock("1")]))
+    assert projector.iteration_cap_exceeded is False
+    projector(AssistantMessage(content=[TextBlock("2")]))
+    assert projector.iteration_cap_exceeded is False
+    projector(AssistantMessage(content=[TextBlock("3")]))
+    assert projector.iteration_cap_exceeded is True
+    # A trailing AssistantMessage after the interrupt went out must not
+    # re-request it.
+    projector(AssistantMessage(content=[TextBlock("4")]))
+
+    assert calls == [1]
+
+
+def test_a_missing_request_interrupt_hook_does_not_crash_the_cap_check():
+    agent = _make_agent("web_search")
+    projector = ClaudeEventProjector(agent, max_internal_iterations=1)
+    projector(AssistantMessage(content=[TextBlock("1")]))
+    projector(AssistantMessage(content=[TextBlock("2")]))
+    assert projector.iteration_cap_exceeded is True
+
+
+def test_run_turn_requests_a_session_interrupt_once_the_cap_is_exceeded():
+    agent = _make_agent("web_search")
+    session = _StubSession(
+        [
+            AssistantMessage(content=[TextBlock("1")]),
+            AssistantMessage(content=[TextBlock("2")]),
+            ResultMessage(result="2"),
+        ]
+    )
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "claude_subscription": {"enabled": True, "max_internal_iterations": 1}
+        },
+    ):
+        result, _messages = _run_turn(agent, session)
+
+    # The cap check runs on run_turn's own drain thread, so it must use the
+    # nowait interrupt (blocking request_interrupt would stall that thread).
+    assert session.nowait_interrupt_requests == 1
+    assert session.interrupt_requests == 0
+    # Hitting the cap ends the turn cleanly (a graceful Hermes-requested
+    # interrupt), not a failure — it stays completed, just annotated.
+    assert result["completed"] is True
+    assert result["partial"] is False
+    assert result["claude_iteration_cap_exceeded"] is True
+    assert "iteration cap" in result["final_response"]
+
+
+def test_run_turn_never_interrupts_when_the_cap_is_not_configured():
+    agent = _make_agent("web_search")
+    session = _StubSession(
+        [
+            AssistantMessage(content=[TextBlock("1")]),
+            AssistantMessage(content=[TextBlock("2")]),
+            ResultMessage(result="2"),
+        ]
+    )
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"claude_subscription": {"enabled": True}},
+    ):
+        result, _messages = _run_turn(agent, session)
+
+    assert session.interrupt_requests == 0
+    assert result["completed"] is True
+    assert "claude_iteration_cap_exceeded" not in result
+
+
+def test_a_capped_turn_never_triggers_an_ack_continuation_requery():
+    """`iteration_cap_exceeded` must gate the ack-continuation loop on its
+    own terms (not merely via `completed`, which the cap no longer forces
+    false) — a turn that trips the cap on an intermediate-ack-shaped final
+    reply must not spend a second `run_turn` re-querying for more."""
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    agent._emit_interim_assistant_message = lambda *_a, **_kw: None
+    # Two internal iterations in attempt 1 (a tool round, then an ack-shaped
+    # reply) so a cap of 1 is exceeded on the second one.
+    first_attempt = [
+        AssistantMessage(
+            content=[ToolUseBlock("t1", "mcp__hermes__web_search", {"query": "a"})]
+        ),
+        UserMessage(content=[ToolResultBlock("t1", "results")]),
+        AssistantMessage(content=[TextBlock("I'll look into the repo now.")]),
+        ResultMessage(result="I'll look into the repo now."),
+    ]
+    session = _MultiCallSession([first_attempt, _ACK_SCRIPT])
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "claude_subscription": {"enabled": True, "max_internal_iterations": 1}
+        },
+    ):
+        result, _messages = _run_turn_multi(agent, session)
+
+    # Only attempt 1 ran — iteration_cap_exceeded excluded it from the
+    # ack-continuation loop directly, even though it's still `completed`.
+    assert session.calls == 1
+    assert result["api_calls"] == 1
+    assert result["completed"] is True
+    assert result["claude_iteration_cap_exceeded"] is True
+
+
+# ---------------------------------------------------------------------------
 # Ack-continuation: a turn that only announces intent re-queries the SAME
 # SDK session, mirroring the codex loop's `codex_ack_continuations < 2`.
 # ---------------------------------------------------------------------------
@@ -1264,6 +1471,12 @@ class _MultiCallSession:
 
     def note_session_id(self, session_id):
         self.session_ids.append(session_id)
+
+    def request_interrupt(self):
+        return True
+
+    def request_interrupt_nowait(self):
+        return True
 
     def close(self):
         self.closed = True

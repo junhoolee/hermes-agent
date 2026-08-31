@@ -232,6 +232,12 @@ class _StubSession:
     def note_session_id(self, session_id):
         pass
 
+    def request_interrupt(self):
+        return True
+
+    def request_interrupt_nowait(self):
+        return True
+
     def close(self):
         self.closed = True
 

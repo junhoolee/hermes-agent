@@ -293,6 +293,52 @@ def test_interrupt_before_start_is_a_no_op():
     assert session.request_interrupt() is False
 
 
+def test_interrupt_nowait_before_start_is_a_no_op():
+    session, _client = _session([[ResultMessage()]])
+    assert session.request_interrupt_nowait() is False
+
+
+def test_interrupt_nowait_called_from_the_on_message_callback_does_not_block():
+    """The iteration-cap check fires from inside ``on_message``, which runs
+    on ``run_turn``'s own calling/drain thread. The blocking
+    ``request_interrupt`` submits+waits (up to its control timeout) on that
+    same thread, which would stall the very drain loop it needs to keep
+    delivering messages. ``request_interrupt_nowait`` must return almost
+    immediately from that call site and the interrupted response must still
+    be drained to completion, exactly like the blocking version does when
+    called from a separate thread in the sibling test above.
+    """
+    session, client = _session(
+        [
+            [AssistantMessage("working"), 5.0, AssistantMessage("never")],
+            [ResultMessage("second-turn")],
+        ]
+    )
+    try:
+        session.ensure_started()
+
+        def _on_message(msg):
+            seen.append(msg)
+            if len(seen) == 1:
+                start = time.monotonic()
+                assert session.request_interrupt_nowait() is True
+                # A blocking request_interrupt() here would take ~as long as
+                # DEFAULT_CONTROL_TIMEOUT_SECONDS in the worst case; nowait
+                # must not wait on the coroutine at all.
+                assert time.monotonic() - start < 1.0
+
+        seen = []
+        session.run_turn("long task", on_message=_on_message, timeout=10.0)
+
+        assert client.interrupts == 1
+        assert is_result_message(seen[-1])
+
+        second = _collect(session, "follow-up", timeout=10.0)
+        assert [m.tag for m in second] == ["second-turn"]
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # Stall watchdog
 # ---------------------------------------------------------------------------
