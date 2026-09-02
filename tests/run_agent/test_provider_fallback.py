@@ -868,6 +868,140 @@ class TestClaudeAgentSdkFallback:
         assert result["interrupted"] is True
         assert agent.api_mode == "claude_agent_sdk"
 
+    def test_a_session_limit_is_error_result_hands_the_turn_to_openai_codex(self):
+        """End-to-end reproduction of the observed outage. The Claude Code
+        CLI reports a session limit not as an exception but as an ordinary
+        ``ResultMessage(is_error=True, result=<limit text>)`` in the normal
+        stream. Driven through the REAL ``run_claude_agent_sdk_turn`` (only
+        the SDK session itself is stubbed), the pre-loop dispatch must see
+        ``failed: True``, advance the chain to the configured
+        openai-codex/gpt-5.6-sol entry, serve the SAME turn over
+        codex_responses, and keep the limit text out of the transcript so
+        role alternation still holds for the fallback provider."""
+        from dataclasses import dataclass
+
+        from agent import claude_runtime
+
+        limit_text = "You've hit your session limit · resets 6pm (Asia/Seoul)"
+
+        # The projector dispatches on the class name, so the stand-in must be
+        # called ResultMessage exactly like the SDK type.
+        @dataclass
+        class ResultMessage:
+            subtype: str = "success"
+            session_id: str = "sdk-session-1"
+            result: str | None = None
+            usage: dict | None = None
+            total_cost_usd: float | None = None
+            terminal_reason: str | None = None
+            is_error: bool = False
+            errors: list | None = None
+
+        class _LimitSession:
+            def __init__(self):
+                self.closed = False
+                self.prompts = []
+
+            def run_turn(
+                self, prompt, *, on_message, timeout=None, stall_timeout=None,
+                stall_exempt=None,
+            ):
+                self.prompts.append(prompt)
+                on_message(ResultMessage(is_error=True, result=limit_text))
+                return 1
+
+            def note_session_id(self, session_id):
+                pass
+
+            def request_interrupt_nowait(self):
+                return True
+
+            def close(self):
+                self.closed = True
+
+        fbs = [
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.api_mode = "claude_agent_sdk"
+        agent.provider = "claude-code"
+        agent.model = "claude-sonnet-5"
+        agent.base_url = "claude-sdk://subscription"
+        agent.client = None
+        # Billing already proven for this session: no throwaway CLI spawn.
+        agent._claude_billing_refusal = None
+        agent._claude_session = session = _LimitSession()
+
+        codex_calls = []
+
+        def _fake_codex_call(api_kwargs):
+            codex_calls.append(api_kwargs)
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        content=[
+                            SimpleNamespace(type="output_text", text="served by codex")
+                        ],
+                    )
+                ],
+                usage=SimpleNamespace(input_tokens=5, output_tokens=3, total_tokens=8),
+                status="completed",
+                model="gpt-5.6-sol",
+            )
+
+        mock_fb_client = _mock_client(
+            base_url="https://chatgpt.com/backend-api/codex", api_key="codex-token"
+        )
+
+        with (
+            patch.object(claude_runtime, "claude_runtime_preflight", return_value=None),
+            patch.object(claude_runtime, "_ensure_session", return_value=session),
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_codex_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_fb_client, "gpt-5.6-sol"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=200000,
+            ),
+        ):
+            result = agent.run_conversation("hello")
+
+        # The SDK was tried exactly once and its wedged session was retired.
+        assert session.prompts == ["hello"]
+        assert session.closed is True
+        assert getattr(agent, "_claude_session", None) is None
+        # The chain advanced to the codex entry and it served the turn.
+        assert agent.api_mode == "codex_responses"
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.6-sol"
+        assert len(codex_calls) == 1
+        assert not result.get("failed")
+        assert result["completed"] is True
+        assert result["final_response"] == "served by codex"
+        # Transcript: the trailing user turn was re-served by codex; the
+        # limit text never landed as an assistant row in between.
+        visible = [m for m in result["messages"] if m.get("role") != "system"]
+        assert [m["role"] for m in visible] == ["user", "assistant"]
+        assert not any(limit_text in str(m.get("content", "")) for m in visible)
+
     def test_gate_closed_claude_code_uses_anthropic_wire_with_oauth_detection(self):
         """While the subscription gate is shut, claude-code still means the
         legacy anthropic path — and the OAuth-token detection must apply to
