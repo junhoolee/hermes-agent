@@ -3,6 +3,15 @@
 > 각 패치가 **왜 필요한지**의 기록. 업스트림 PR #80469이 업데이트되면 이 문서로 "아직 필요한 패치인가"를 판단하세요.
 > 모든 패치는 TDD로 작성됨 — 각 커밋의 회귀 테스트는 패치 전 코드에서 실제로 실패합니다(커밋 메시지에 실패 출력 요약 있음). 적대적 교차 리뷰 2회 통과.
 
+## 브랜치 구성 (2026-09-02 기준)
+
+| 항목 | 값 |
+|---|---|
+| 기반 | upstream/main `acfd376d66` (2026-07-29) + PR #80469 원본 커밋 `330a533191` |
+| 자체 패치 | 18개 (`330a533191..HEAD`), 문서 2개 포함 |
+| 추적 중인 PR head | `9326a55742` (base upstream/main `5538bd1f93`, 2026-08-15) — 아직 OPEN, 미머지 |
+| 리베이스 목표 | `git rebase --onto <PR head> 330a533191` 로 PR 원본 커밋을 새 head로 교체 |
+
 ## 배경: 업스트림 PR #80469이 미완성인 지점
 
 PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는 provider를 추가합니다. 설계 품질은 높지만,
@@ -10,7 +19,13 @@ PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는
 공통 원인 하나가 여러 곳에서 발현됩니다: **구독 런타임은 `api_key: ""`가 계약**(SDK가 유저의 claude 로그인을 스스로 해석)인데,
 기존 코드 곳곳이 "api_key 없음 = provider 미설정"으로 가정합니다.
 
+2차 패치 묶음(8월 하순, 7~12번)의 공통 주제는 다릅니다: codex 런타임에는 있는 **운영 안전장치**(heartbeat, 워치독,
+/steer 전달, ack 자동 이어가기, 반복 상한, 실패 시 폴백)가 claude_agent_sdk 경로에는 없어서, 무인 운영 시 턴이 조용히
+멈추거나 사용자 개입이 전달되지 않는 문제를 메운 것입니다.
+
 ---
+
+## 1차 패치 (2026-08-06 ~ 08-09)
 
 ### 1. `60010cf` — 브리지 툴 승인 컨텍스트 상실 (보안, 가장 중요)
 
@@ -49,14 +64,69 @@ PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는
 - **수정**: `AssistantMessage.usage`(호출당 개별)를 추적해 **마지막 호출**의 input+cache_read+cache_write를 컨텍스트 크기로 보고.
   빌링 누계는 기존 cumulative 그대로(미접촉). per-call usage가 없는 구형 CLI는 cumulative 폴백.
 
-### 6. `커밋 없음` — 문서 (INSTALL-claude-subscription-KO.md, 본 문서)
+### 6. `c20ee89` + `c3c8bf3` — 문서 (INSTALL-claude-subscription-KO.md, 본 문서)
+
+---
+
+## 2차 패치 (2026-08-19 ~ 09-01)
+
+### 7. `cd99d07` — Slack: 강조 변환 전에 bare URL을 `<url>`로 감싸기 (Claude 무관)
+
+- **증상**: Slack 어댑터가 마크다운 강조(`_`, `*`)를 변환할 때 URL 안의 `_`까지 건드려 링크가 깨짐.
+- **수정**: 강조 변환 전에 bare URL을 Slack 링크 문법 `<url>`로 먼저 감싸 보호. 유일하게 claude_agent_sdk와 무관한 패치.
+- 업스트림 `plugins/platforms/slack/adapter.py` 변경 시 여전히 필요한지 재확인.
+
+### 8. `167e9eb` — auxiliary: 비동기 vision 경로에서 구독 shim 변환 누락
+
+- **증상**: claude-code provider에서 vision 호출이 **간헐적으로** "Connection error"로 실패 (동기 경로는 정상, 비동기 경로만 실패).
+- **원인**: `_to_async_client`에 구독 shim 분기가 없어 generic 변환기가 shim을 `AsyncOpenAI(base_url='claude-sdk://subscription')`로 감쌈 → httpx UnsupportedProtocol.
+- **수정**: Codex/Anthropic/Bedrock 어댑터처럼 shim을 `AsyncClaudeAuxiliaryClient`로 라우팅해 원샷 SDK 경로 유지.
+
+### 9. `c567853` — 런타임: SDK 이벤트로 last-activity heartbeat
+
+- **증상**: 범용 staleness 워치독(kanban worker reclaim, delegate heartbeat 진단)이 길게 도는 정상 Claude 턴을 stall로 오판.
+- **원인**: `_dispatch()`가 `agent._touch_activity`를 한 번도 호출하지 않음.
+- **수정**: 디스패치되는 모든 SDK 메시지에서 touch, 초당 1회로 throttle (StreamEvent는 content-block delta마다 옴). `_fire()` 경유라 메서드 없는 경량 stand-in도 안전.
+
+### 10. `abde6bd` — 런타임: 침묵 SDK 턴용 stall 워치독
+
+- **증상**: CLI 서브프로세스가 중간에 멎으면(wedged pipe 등) 유일한 가드가 1800초 턴 데드라인이라 30분간 "생각 중"으로 보임. codex에는 TTFB 워치독이 있는데 Claude 턴엔 없었음.
+- **수정**: `run_turn(stall_timeout, stall_exempt)` — `stall_timeout`(기본 300초, `claude_subscription.stall_timeout`, 0이면 비활성) 동안 SDK 메시지가 없으면 데드라인과 구분되는 TimeoutError를 올려 기존 `should_retire=True` 처리로 라우팅.
+- **오탐 방지**: 브리지 툴 호출 중엔 정상적으로 SDK 메시지가 없으므로, `run_bridged_tool`이 agent에 inflight 카운터(lock 보호, 병렬 read-tool 배치 대응)를 유지하고 `stall_exempt=lambda: inflight > 0`으로 연결.
+
+### 11. `63c04cb` — 런타임: `/steer`를 브리지 툴 결과와 턴 결과로 전달
+
+- **증상**: 턴 진행 중 사용자가 보낸 `/steer`가 claude_agent_sdk 경로에서는 모델에 도달하지 않음.
+- **수정**: `claude_tool_bridge._append_pending_steer`가 다음 브리지 툴 결과에 steer를 붙여 즉시 전달. 마지막 툴 호출 이후에 도착했거나 툴을 안 쓴 턴이면 `_attach_leftover_steer`가 `result["pending_steer"]`로 넘겨 chat_completions 경로와 동일한 핸드오프 계약을 따름.
+
+### 12. `0a4c115` — 런타임: 중간 ack 자동 이어가기 (codex 루프와 동등)
+
+- **증상**: 모델이 "확인해 볼게요..." 같은 의도 선언만 하고 행동 없이 턴을 끝내면 그대로 종료. codex 경로는 `codex_ack_continuations < 2`로 자동 이어가는데 Claude 경로엔 없었음.
+- **수정**: `run_claude_agent_sdk_turn`이 최종 텍스트가 중간 ack로 보이면 같은 SDK 세션에 최대 2회 재질의(중간 텍스트는 interim assistant 메시지로 방출, 동일 continuation 프롬프트를 user 턴으로 추가). continuation 실패는 1차 결과로 강하(턴 실패 아님).
+- **게이트**: `intent_ack_continuation_mode`(opt-in) + `claude_subscription.ack_continuation` kill switch(기본 on). `api_calls`는 실제 run_turn 횟수(1~3) 반영, 시도별 회계는 `_record_claude_attempt` 헬퍼로 공유.
+
+### 13. `8b45fc4` — 런타임: SDK 내부 반복 횟수 노출 및 상한
+
+- **내용**: `ClaudeAgentSession`이 SDK 내부 반복(assistant 턴) 수를 `iteration_count`로 추적하고 `max_internal_iterations` 상한 도달 시 `iteration_cap_exceeded` 플래그. 기존 `tool_iterations`(개별 툴콜 수)와 별개 지표. 무한 루프 방어 + 관측성.
+
+### 14. `1f6b616` — 폴백: 실패한 claude_agent_sdk 턴을 폴백 체인으로 넘기기
+
+- **증상**: SDK 턴 실패(preflight/빌링 거부, 세션 생성 오류, stall/턴 타임아웃)가 `fallback_providers`가 있어도 사용자에게 바로 에러로 반환. 3번(codex→claude 핸드오프)의 역방향이 없었음.
+- **수정**: 디스패치를 루프로 — 체인의 다른 claude_agent_sdk 엔트리는 SDK 블록 재시도(다른 모델 핀 가능), codex_app_server는 직접 디스패치, HTTP 런타임은 표준 retry 루프로 낙하(`_sanitize_api_messages`가 dangling tool_calls 정리). 사용자 인터럽트는 재라우팅하지 않음.
+
+### 15. `da4df15` — 모델 카탈로그: anthropic/claude-fable-5.1 추가
+
+- 업스트림 `9f069a11` cherry-pick. OpenRouter/Nous 큐레이션 목록에 5.1 추가, 매니페스트는 `scripts/build_model_catalog.py`로 로컬 재생성(업스트림 json hunk 미적용). 리베이스 시 업스트림에 이미 있으면 폐기.
 
 ---
 
 ## 업스트림 추적
 
-- 원본 PR: https://github.com/NousResearch/hermes-agent/pull/80469 (base sha `330a533191`)
+- 원본 PR: https://github.com/NousResearch/hermes-agent/pull/80469
+  - 우리 기반 커밋: `330a533191` (7월 말 base) / 현재 PR head: `9326a55742` (2026-08-15 base로 리베이스됨, 코드 hunk 45개 변경)
 - PR이 업데이트/머지되면: 위 증상별 회귀 테스트를 새 코드에서 돌려보세요 — 통과하면 해당 패치는 폐기 가능.
-  테스트 위치: `tests/run_agent/test_provider_fallback.py`(3번), `tests/agent/test_claude_tool_bridge.py`(1번),
+  테스트 위치: `tests/run_agent/test_provider_fallback.py`(3, 14번), `tests/agent/test_claude_tool_bridge.py`(1, 10, 11번),
   `tests/gateway/test_compress_command.py`·`test_session_hygiene.py`·`test_background_task_runtime_gate.py`(4번),
-  `tests/agent/test_claude_runtime.py`(2·5번).
+  `tests/agent/test_claude_runtime.py`(2, 5, 9~13번), `tests/agent/test_claude_auxiliary.py`(8번), `tests/gateway/test_slack.py`(7번).
+- 리베이스 절차: `git rebase --onto 9326a55742 330a533191 pr80469-patches` (PR 원본 커밋을 새 head로 교체). 충돌 규모 사전 측정은
+  `git merge-tree --write-tree --merge-base=<commit>^ 9326a55742 <commit>` 로 패치별 시뮬레이션 가능.
