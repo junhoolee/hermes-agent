@@ -956,6 +956,37 @@ def test_a_wedged_turn_retires_the_session_so_the_next_one_respawns():
     assert "stalled" in result["error"]
 
 
+def test_an_is_error_result_hands_the_turn_off_as_a_failed_attempt():
+    """A CLI-reported error (e.g. a session-limit ResultMessage) with no
+    exception, no cap, and no user interrupt must surface as a real turn
+    failure — ``failed: True`` — so the caller's fallback chain (Codex etc.)
+    actually activates, instead of silently returning the error text as a
+    normal ``completed: False`` assistant reply."""
+    agent = _make_agent("web_search")
+    agent._claude_session = session = _StubSession(
+        [
+            ResultMessage(
+                subtype="success",
+                is_error=True,
+                result="You've hit your session limit · resets 6pm (Asia/Seoul)",
+            )
+        ]
+    )
+    result, messages = _run_turn(agent, session)
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert "session limit" in result["error"]
+    assert "session limit" in result["final_response"]
+    # The failed attempt's assistant output must not land in the transcript
+    # — the fallback provider re-processes the turn from the trailing user
+    # message, so an appended assistant row would break role alternation.
+    assert messages == []
+    # The wedged SDK session must not be reused by the next (fallback) turn.
+    assert session.closed is True
+    assert getattr(agent, "_claude_session", None) is None
+
+
 def test_tool_iterations_feed_the_skill_nudge_counter():
     agent = _make_agent("web_search")
     agent._iters_since_skill = 0
@@ -1383,6 +1414,42 @@ def test_run_turn_requests_a_session_interrupt_once_the_cap_is_exceeded():
     assert result["partial"] is False
     assert result["claude_iteration_cap_exceeded"] is True
     assert "iteration cap" in result["final_response"]
+
+
+def test_a_capped_turns_is_error_result_is_not_treated_as_a_failed_attempt():
+    """The SDK may itself flag the cap-triggered interrupt's ResultMessage as
+    an error, but that interrupt was requested by Hermes, not the CLI
+    choking — it must not be handed to the fallback chain as ``failed: True``
+    the way an uncapped is_error result is.
+
+    NOTE: ``completed`` itself still comes out ``False`` here, not ``True`` —
+    a separate, pre-existing quirk in ``_record_claude_attempt`` (it copies
+    ``projector.error`` onto ``turn_error`` whenever ``is_error`` is set,
+    with no ``iteration_cap_exceeded`` exemption, which then fails the
+    ``turn_error is None`` arm of the ``completed`` expression regardless of
+    the cap). That is out of scope for this fix (see docs/PATCHES-KO.md #16)
+    — this test only pins down that it does NOT regress into `failed: True`.
+    """
+    agent = _make_agent("web_search")
+    session = _StubSession(
+        [
+            AssistantMessage(content=[TextBlock("1")]),
+            AssistantMessage(content=[TextBlock("2")]),
+            ResultMessage(
+                subtype="error_during_execution", is_error=True, result="2"
+            ),
+        ]
+    )
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={
+            "claude_subscription": {"enabled": True, "max_internal_iterations": 1}
+        },
+    ):
+        result, _messages = _run_turn(agent, session)
+
+    assert "failed" not in result
+    assert result["claude_iteration_cap_exceeded"] is True
 
 
 def test_run_turn_never_interrupts_when_the_cap_is_not_configured():
