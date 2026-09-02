@@ -1999,7 +1999,16 @@ def _record_claude_attempt(
                 user_ordinal=user_ordinal,
                 watermark=watermark,
             )
-    if turn_error is None and projector.error:
+    # A cap-triggered interrupt makes the SDK flag its own ResultMessage as an
+    # error; that is Hermes ending the turn, not the CLI failing it. The
+    # ``completed`` expression in run_claude_agent_sdk_turn already exempts
+    # the cap from ``is_error`` — this arm must not smuggle the same abort
+    # text back in as a ``turn_error`` and fail ``completed`` anyway.
+    if (
+        turn_error is None
+        and projector.error
+        and not projector.iteration_cap_exceeded
+    ):
         turn_error = projector.error
 
     # A wedged or crashed client must not be reused: the next turn respawns
@@ -2355,6 +2364,39 @@ def run_claude_agent_sdk_turn(
                 "claude_agent_sdk ack-continuation run_turn failed: %s", exc
             )
             _retire_session(agent)
+            break
+
+        if _sdk_turn_reported_failure(
+            None,
+            bool(getattr(agent, "_interrupt_requested", False)),
+            continuation_projector,
+        ):
+            # Same contract as the exception arm above: the continuation is
+            # optional, so a CLI-reported error on it (e.g. the session
+            # limit landing between attempt 1 and the re-query) drops the
+            # dangling continuation prompt and reports attempt 1's result —
+            # instead of splicing the error text into the transcript as the
+            # reply and downgrading the turn to completed=False. The wedged
+            # session is retired so the NEXT turn's first attempt respawns
+            # and, if the error persists, hands off to the fallback chain
+            # through the is_error path above. Usage/compaction accounting
+            # still runs; persist=False only skips the transcript splice.
+            messages.pop()
+            logger.warning(
+                "claude_agent_sdk ack-continuation reported is_error: %s — "
+                "keeping attempt 1's result",
+                continuation_projector.error or continuation_projector.final_text,
+            )
+            _record_claude_attempt(
+                agent,
+                messages,
+                session,
+                continuation_projector,
+                None,
+                True,
+                bind_session=False,
+                persist=False,
+            )
             break
 
         projector = continuation_projector
