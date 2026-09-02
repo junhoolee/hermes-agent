@@ -118,6 +118,12 @@ PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는
 
 - 업스트림 `9f069a11` cherry-pick. OpenRouter/Nous 큐레이션 목록에 5.1 추가, 매니페스트는 `scripts/build_model_catalog.py`로 로컬 재생성(업스트림 json hunk 미적용). 리베이스 시 업스트림에 이미 있으면 폐기.
 
+### 16. `eadb6b1a47` — 폴백: is_error ResultMessage(세션 한도 등)를 실패로 취급
+
+- **증상**: Claude Code CLI는 한도 초과 시 예외를 던지지 않고 `is_error=True` + `result=<에러 문구>`인 `ResultMessage`를 정상 스트림으로 보낸다. `run_claude_agent_sdk_turn`은 이를 `completed=False` partial 응답으로 조용히 사용자에게 반환할 뿐 `"failed"`를 세우지 않아, 14번 패치가 만든 폴백 디스패치 루프(`sdk_result.get("failed")`가 참일 때만 `_try_activate_fallback()` 호출)가 전혀 발동하지 않았다 — 14번의 빈 구멍.
+- **수정**: `run_turn`이 예외 없이 끝났고 `projector.is_error`가 참이며 `iteration_cap_exceeded`가 거짓이고 사용자 인터럽트가 아닌 경우를 새 헬퍼 `_sdk_turn_reported_failure`로 판정해 턴 실패로 취급. `_record_claude_attempt`에 `persist` 플래그를 추가해 이 경우 에러 문구를 담은 assistant 메시지가 `messages`/세션DB에 남지 않게 하고(폴백 provider가 같은 trailing user 메시지부터 다시 처리하므로 role alternation 유지), `_retire_session`으로 SDK 세션을 폐기하고, `failed=True`인 `_failure_result`를 반환한다. iteration cap으로 SDK가 `is_error`를 세우는 경우(사용자가 아닌 Hermes가 요청한 인터럽트)는 기존대로 실패가 아니며, run_turn 예외 경로(기존 turn_error/stale-session recovery)는 손대지 않았다.
+- **폐기 기준**: 업스트림 `run_claude_agent_sdk_turn`이 is_error 결과에 `failed=True`를 반환하면 폐기.
+
 ---
 
 ## 업스트림 추적
