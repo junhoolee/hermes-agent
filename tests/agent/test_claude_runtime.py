@@ -1420,15 +1420,11 @@ def test_a_capped_turns_is_error_result_is_not_treated_as_a_failed_attempt():
     """The SDK may itself flag the cap-triggered interrupt's ResultMessage as
     an error, but that interrupt was requested by Hermes, not the CLI
     choking — it must not be handed to the fallback chain as ``failed: True``
-    the way an uncapped is_error result is.
-
-    NOTE: ``completed`` itself still comes out ``False`` here, not ``True`` —
-    a separate, pre-existing quirk in ``_record_claude_attempt`` (it copies
-    ``projector.error`` onto ``turn_error`` whenever ``is_error`` is set,
-    with no ``iteration_cap_exceeded`` exemption, which then fails the
-    ``turn_error is None`` arm of the ``completed`` expression regardless of
-    the cap). That is out of scope for this fix (see docs/PATCHES-KO.md #16)
-    — this test only pins down that it does NOT regress into `failed: True`.
+    the way an uncapped is_error result is — and it must not be reported as
+    a ``completed: False`` partial turn carrying the SDK's abort text as its
+    ``error`` either. The cap exemption has to hold on BOTH arms: the
+    ``completed`` expression's ``is_error`` term and
+    ``_record_claude_attempt``'s ``projector.error -> turn_error`` copy.
     """
     agent = _make_agent("web_search")
     session = _StubSession(
@@ -1450,6 +1446,10 @@ def test_a_capped_turns_is_error_result_is_not_treated_as_a_failed_attempt():
 
     assert "failed" not in result
     assert result["claude_iteration_cap_exceeded"] is True
+    assert result["completed"] is True
+    assert result["partial"] is False
+    assert result["error"] is None
+    assert "iteration cap" in result["final_response"]
 
 
 def test_run_turn_never_interrupts_when_the_cap_is_not_configured():
@@ -1717,6 +1717,41 @@ def test_a_continuation_failure_falls_back_to_the_prior_attempts_result():
     assert result["completed"] is True
     assert result["api_calls"] == 1
     assert result["final_response"] == "I'll look into the repo now."
+    assert not any(
+        m.get("role") == "user" and m.get("content") == claude_runtime._ACK_CONTINUE_TEXT
+        for m in messages
+    )
+
+
+def test_a_continuation_is_error_result_falls_back_to_the_prior_attempts_result():
+    """An is_error ResultMessage on the ack-continuation pass (e.g. the
+    session limit landing between attempt 1 and the re-query) is the same
+    situation as the continuation raising: the continuation is optional, so
+    attempt 1's completed result is reported, the dangling continuation
+    prompt is dropped, the limit text never lands in the transcript, and the
+    wedged session is retired so the NEXT turn's first attempt respawns —
+    and, if the limit persists, hands off to the fallback chain."""
+    agent = _make_agent("web_search")
+    agent._intent_ack_continuation = True
+    agent._emit_interim_assistant_message = lambda *_a, **_kw: None
+    limit_text = "You've hit your session limit · resets 6pm (Asia/Seoul)"
+    agent._claude_session = session = _MultiCallSession(
+        [
+            _ACK_SCRIPT,
+            [ResultMessage(subtype="success", is_error=True, result=limit_text)],
+        ]
+    )
+    result, messages = _run_turn_multi(agent, session)
+
+    assert session.calls == 2
+    assert session.closed is True
+    assert getattr(agent, "_claude_session", None) is None
+    assert "failed" not in result
+    assert result["completed"] is True
+    assert result["api_calls"] == 1
+    assert result["final_response"] == "I'll look into the repo now."
+    assert result["error"] is None
+    assert not any(limit_text in str(m.get("content", "")) for m in messages)
     assert not any(
         m.get("role") == "user" and m.get("content") == claude_runtime._ACK_CONTINUE_TEXT
         for m in messages
