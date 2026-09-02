@@ -1970,6 +1970,7 @@ def _record_claude_attempt(
     cwd: Optional[str] = None,
     user_ordinal: Optional[int] = None,
     watermark: Any = None,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     """Finalize one SDK ``run_turn`` call: persist projected messages, bind or
     retire the session, and roll usage/compaction bookkeeping.
@@ -1979,6 +1980,13 @@ def _record_claude_attempt(
     ``record_claude_session_binding`` is the one exception, gated by
     ``bind_session`` since it is attempt-1-only (same ``user_ordinal``
     semantics as before continuation existed).
+
+    ``persist=False`` skips splicing the projected messages into ``messages``
+    and flushing them to the session DB — used when the SDK reported a hard
+    turn failure (see ``_sdk_turn_reported_failure``): the fallback chain
+    re-processes the turn from the same trailing user message, so the failed
+    attempt's assistant output must not land in the transcript. Usage and
+    compaction bookkeeping still run either way.
     """
     projected = projector.finalize()
     if projector.session_id:
@@ -2006,7 +2014,7 @@ def _record_claude_attempt(
     if user_interrupted:
         agent.clear_interrupt()
 
-    if projected:
+    if persist and projected:
         messages.extend(projected)
         # This path is an early return that bypasses conversation_loop, whose
         # per-step _persist_session() calls would otherwise flush these rows.
@@ -2042,6 +2050,27 @@ def _record_claude_attempt(
         "interrupt_message": interrupt_message,
         "usage_result": usage_result,
     }
+
+
+def _sdk_turn_reported_failure(
+    turn_error: Optional[str],
+    user_interrupted: bool,
+    projector: "ClaudeEventProjector",
+) -> bool:
+    """True when the SDK itself ended the turn in an error state — e.g. a CLI
+    session-limit ``ResultMessage`` — rather than ``run_turn`` raising or a
+    user interrupt. This is a real turn failure the fallback chain must see
+    (``_failure_result``'s ``"failed": True``), not just a ``completed=False``
+    partial result. A cap-triggered interrupt is excluded: the SDK may itself
+    flag that as an error, but the interrupt was requested by Hermes, not the
+    CLI choking.
+    """
+    return (
+        turn_error is None
+        and not user_interrupted
+        and projector.is_error
+        and not projector.iteration_cap_exceeded
+    )
 
 
 def _failure_result(
@@ -2216,6 +2245,12 @@ def run_claude_agent_sdk_turn(
             logger.exception("claude_agent_sdk turn failed")
         break
 
+    sdk_failed = _sdk_turn_reported_failure(
+        turn_error, bool(getattr(agent, "_interrupt_requested", False)), projector
+    )
+    if sdk_failed:
+        should_retire = True
+
     attempt_record = _record_claude_attempt(
         agent,
         messages,
@@ -2227,11 +2262,28 @@ def run_claude_agent_sdk_turn(
         cwd=cwd,
         user_ordinal=user_ordinal,
         watermark=watermark,
+        persist=not sdk_failed,
     )
     turn_error = attempt_record["turn_error"]
     user_interrupted = attempt_record["user_interrupted"]
     interrupt_message = attempt_record["interrupt_message"]
     usage_result = attempt_record["usage_result"]
+
+    if sdk_failed:
+        error_text = (
+            projector.error
+            or projector.final_text
+            or "Claude Agent SDK reported an error"
+        )
+        logger.warning(
+            "claude_agent_sdk turn reported is_error (session=%s): %s — "
+            "handing off to fallback chain",
+            getattr(agent, "session_id", None) or "none",
+            error_text,
+        )
+        return _failure_result(
+            agent, messages, final_response=error_text, error=error_text
+        )
 
     api_calls = 1
     final_text = projector.final_text
