@@ -123,6 +123,13 @@ PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는
 - **증상**: Claude Code CLI는 한도 초과 시 예외를 던지지 않고 `is_error=True` + `result=<에러 문구>`인 `ResultMessage`를 정상 스트림으로 보낸다. `run_claude_agent_sdk_turn`은 이를 `completed=False` partial 응답으로 조용히 사용자에게 반환할 뿐 `"failed"`를 세우지 않아, 14번 패치가 만든 폴백 디스패치 루프(`sdk_result.get("failed")`가 참일 때만 `_try_activate_fallback()` 호출)가 전혀 발동하지 않았다 — 14번의 빈 구멍.
 - **수정**: `run_turn`이 예외 없이 끝났고 `projector.is_error`가 참이며 `iteration_cap_exceeded`가 거짓이고 사용자 인터럽트가 아닌 경우를 새 헬퍼 `_sdk_turn_reported_failure`로 판정해 턴 실패로 취급. `_record_claude_attempt`에 `persist` 플래그를 추가해 이 경우 에러 문구를 담은 assistant 메시지가 `messages`/세션DB에 남지 않게 하고(폴백 provider가 같은 trailing user 메시지부터 다시 처리하므로 role alternation 유지), `_retire_session`으로 SDK 세션을 폐기하고, `failed=True`인 `_failure_result`를 반환한다. iteration cap으로 SDK가 `is_error`를 세우는 경우(사용자가 아닌 Hermes가 요청한 인터럽트)는 기존대로 실패가 아니며, run_turn 예외 경로(기존 turn_error/stale-session recovery)는 손대지 않았다.
 - **폐기 기준**: 업스트림 `run_claude_agent_sdk_turn`이 is_error 결과에 `failed=True`를 반환하면 폐기.
+- **검증**: `tests/run_agent/test_provider_fallback.py::test_a_session_limit_is_error_result_hands_the_turn_to_openai_codex`(`327454614b`)가 실제 `run_claude_agent_sdk_turn`을 통과시켜 세션 한도 ResultMessage → `openai-codex/gpt-5.6-sol` 핸드오프를 E2E로 재현한다.
+
+### 17. `f98eddeb00` — 폴백 후속: cap·continuation 경로의 is_error 처리 보정
+
+- **증상**: 16번과 같은 클래스의 두 갭. (1) iteration cap 인터럽트로 SDK가 `is_error`를 세우면 `_record_claude_attempt`가 `projector.error`를 `turn_error`로 복사해, `completed` 식의 cap 예외 주석("is_error is ignored whenever the cap fired")과 달리 `completed=False`/`partial=True`/`error=<abort 문구>`로 반환됐다(`failed=True` 오발동은 없었음). (2) ack-continuation의 2번째 `run_turn`이 세션 한도 등으로 `is_error` ResultMessage를 돌려주면 그 에러 문구가 assistant 행으로 `messages`/세션DB에 남고 `completed=False`로 떨어지며 폴백도 발동하지 않았다.
+- **수정**: (1) `turn_error` 복사에도 `iteration_cap_exceeded` 예외를 적용. (2) continuation 결과에 `_sdk_turn_reported_failure`를 적용해 참이면 예외 arm과 동일 계약으로 처리 — continuation 프롬프트 pop, usage/compaction 회계만 기록(`persist=False`), 세션 retire, attempt 1의 완료 결과를 그대로 보고. 한도가 지속되면 다음 턴의 첫 attempt가 16번 경로로 폴백 체인에 넘긴다.
+- **폐기 기준**: 16번과 함께 폐기(업스트림이 is_error를 실패로 다루고 cap/continuation을 구분하면).
 
 ---
 
@@ -131,8 +138,8 @@ PR #80469은 Claude **구독**(Pro/Max/Team)을 공식 Agent SDK로 연결하는
 - 원본 PR: https://github.com/NousResearch/hermes-agent/pull/80469
   - 우리 기반 커밋: `330a533191` (7월 말 base) / 현재 PR head: `9326a55742` (2026-08-15 base로 리베이스됨, 코드 hunk 45개 변경)
 - PR이 업데이트/머지되면: 위 증상별 회귀 테스트를 새 코드에서 돌려보세요 — 통과하면 해당 패치는 폐기 가능.
-  테스트 위치: `tests/run_agent/test_provider_fallback.py`(3, 14번), `tests/agent/test_claude_tool_bridge.py`(1, 10, 11번),
+  테스트 위치: `tests/run_agent/test_provider_fallback.py`(3, 14, 16번), `tests/agent/test_claude_tool_bridge.py`(1, 10, 11번),
   `tests/gateway/test_compress_command.py`·`test_session_hygiene.py`·`test_background_task_runtime_gate.py`(4번),
-  `tests/agent/test_claude_runtime.py`(2, 5, 9~13번), `tests/agent/test_claude_auxiliary.py`(8번), `tests/gateway/test_slack.py`(7번).
+  `tests/agent/test_claude_runtime.py`(2, 5, 9~13, 16, 17번), `tests/agent/test_claude_auxiliary.py`(8번), `tests/gateway/test_slack.py`(7번).
 - 리베이스 절차: `git rebase --onto 9326a55742 330a533191 pr80469-patches` (PR 원본 커밋을 새 head로 교체). 충돌 규모 사전 측정은
   `git merge-tree --write-tree --merge-base=<commit>^ 9326a55742 <commit>` 로 패치별 시뮬레이션 가능.
