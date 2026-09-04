@@ -108,6 +108,20 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
+    @pytest.mark.parametrize("deliver", ["none", " NONE ", "NoNe"])
+    def test_none_skips_gateway_delivery_checks(self, deliver, monkeypatch):
+        """Explicit no-delivery jobs need neither a platform nor gateway config."""
+        monkeypatch.setattr(
+            sched,
+            "_is_known_delivery_platform",
+            lambda _platform: pytest.fail("none must not be treated as a platform"),
+        )
+        with patch(
+            "gateway.config.load_gateway_config",
+            side_effect=AssertionError("none must not load gateway config"),
+        ):
+            assert _preflight_check_delivery({"deliver": deliver}) is None
+
     def test_relay_fronted_slack_accepted(self, monkeypatch):
         """Relay-only topology fronting slack: slack:CHAT passes preflight."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")
