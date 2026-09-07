@@ -6,7 +6,7 @@ Pro/Max/Team subscription without an ACP subprocess. Registers itself as an
 for the sibling pattern) and supplies its own client via
 `ProviderProfile.create_client()` — no core edits required.
 
-## Status: v0.1-D
+## Status: v0.1-E
 
 - v0.1-A (profile registration, settings, scrubbed child environment, error
   mapping, message→prompt conversion, synchronous one-shot session runner) plus:
@@ -74,9 +74,42 @@ for the sibling pattern) and supplies its own client via
   bridge tool call is in flight, and an open-turn (`orphan_timeout`) watchdog
   that interrupts and tears down a turn paused on `tool_calls` if Hermes core
   never sends the continuation (fallback switch, upstream error, etc.).
-- Still one-session-per-turn: v0.1 opens a brand new `SdkSession` for every
-  fresh user turn (not every tool round-trip) and replays the whole
-  bootstrapped conversation as the prompt — see "Known limitations".
+- Still one-session-per-turn for a genuinely *new* user turn (system/model/
+  reasoning/tools changed, or the history doesn't match a warm session's own
+  record) — see "Known limitations".
+- **Warm session retention** (v0.1-E): the whole point of this plugin is to
+  avoid the cold-start-per-turn tax of a subprocess-based provider (~7-12s
+  CLI spawn plus a full bootstrapped-history reprompt, ~4M tokens
+  re-transmitted). After a turn reaches `finish_reason="stop"`, the
+  underlying `SdkSession` (its CLI subprocess and event-loop thread) is kept
+  alive — `idle` — instead of closed, *if and only if* the caller gave an
+  explicit `extra_body["hermes_session_id"]` (the aux one-shot client never
+  does, so it keeps closing immediately — unaffected). An idle session is
+  reclaimed by a `claude_sub.idle_session_ttl` timer (default 30 minutes; `0`
+  disables warm retention entirely, reverting to always-close).
+  - A follow-up `create()` is treated as a **warm follow-up** — same
+    `SdkSession`, a plain `query()` with *only the new user text* as the
+    prompt, no `<operating_instructions>`/`<prior_conversation>` re-wrapping
+    (the CLI already holds that context; see `client.py`'s
+    `_is_warm_followup`) — only when *every* one of these holds:
+    the caller's `messages` is exactly this session's known history plus new
+    user text (the assistant reply on record must match verbatim — a
+    compaction/history rewrite invalidates it), and the `system` text,
+    `model`, `reasoning_effort`, and tool set are all unchanged. Any mismatch
+    is treated as a new conversation: the idle session is discarded (closed)
+    and a fresh one opened with the full bootstrapped prompt, exactly like
+    v0.1-D.
+  - The v0.1-D tool-call inversion contract (pause on `tool_calls`, resume
+    via `continue_turn()` on the matching continuation) is unaffected by
+    warm retention — it operates purely on the in-flight `_Turn`, whether
+    that turn was opened cold or via a warm follow-up.
+  - Idle-timer bookkeeping: a follow-up arriving before the TTL expires
+    cancels the timer and resumes the same session; the CLI does not restart
+    twice in a race between an about-to-fire timer and an incoming warm
+    follow-up (`_arm_idle_timer`'s callback re-checks the same `_Turn`
+    identity and `state == "idle"` under `_turns_lock` before closing).
+  - `ClaudeSubClient.close()` cancels every idle timer and closes every idle
+    session, same as any other open turn.
 
 ## Prerequisites
 
@@ -107,6 +140,9 @@ claude_sub:
                              # tool_calls response before interrupting the open turn
   bootstrap_max_chars: 60000  # cap on replayed prior-conversation history
   identity_append: ""       # override the default Hermes identity append
+  idle_session_ttl: 1800.0  # seconds to keep a stopped session's CLI subprocess
+                             # warm for a possible follow-up turn (0 disables —
+                             # always close immediately on stop, the v0.1-D behavior)
 ```
 
 Non-streaming callers (e.g. the auxiliary client) should also set the core
@@ -123,16 +159,21 @@ providers:
 ## Known limitations (v0.1)
 
 - No image input (`supports_vision=False`).
-- No `resume`/session-store integration — every fresh user turn starts a new
-  SDK session and replays the bootstrapped conversation as its prompt.
-  Prompt-cache reuse across turns is a known v0.1 trade-off, not a bug.
+- No `resume`/session-store integration across process restarts — this
+  plugin never resumes a prior transcript after Hermes itself restarts. Within
+  one running process, a session can be kept warm across turns (v0.1-E, see
+  above) as long as the caller passes a stable `hermes_session_id` and the
+  history/model/tools stay exactly as that session last saw them; anything
+  else (a genuinely new conversation, a history mismatch, `idle_session_ttl`
+  expiry, or `idle_session_ttl: 0`) falls back to a fresh SDK session that
+  replays the bootstrapped conversation as its prompt.
 - Interrupting a turn that's mid bridge-tool-call has the same latency as any
   other interrupt — the SDK doesn't cancel an in-flight tool result wait any
   faster than a normal generation.
-- One SDK session per new turn, not per tool round-trip: a multi-tool-call
-  turn (`tool_calls` → continuation → `tool_calls` → continuation → ...) stays
-  on the same session/turn until the final `stop`; only a genuinely new user
-  message opens a new one.
+- One SDK session per new (cold) turn, not per tool round-trip: a
+  multi-tool-call turn (`tool_calls` → continuation → `tool_calls` →
+  continuation → ...) stays on the same session/turn until the final `stop`;
+  only a genuinely new or mismatched user turn opens a new one.
 
 ## E2E reproduction
 

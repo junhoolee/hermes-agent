@@ -19,6 +19,7 @@ class Settings:
     orphan_timeout: float = 120.0
     bootstrap_max_chars: int = 60000
     identity_append: str = ""
+    idle_session_ttl: float = 1800.0
 
 
 def _coerce_float(value, default: float) -> float:
@@ -63,6 +64,9 @@ def load_settings() -> Settings:
         raw = {}
 
     defaults = Settings()
+    idle_session_ttl = _coerce_float(raw.get("idle_session_ttl"), defaults.idle_session_ttl)
+    if idle_session_ttl < 0:
+        idle_session_ttl = 0.0
     return Settings(
         start_timeout=_coerce_float(raw.get("start_timeout"), defaults.start_timeout),
         turn_timeout=_coerce_float(raw.get("turn_timeout"), defaults.turn_timeout),
@@ -70,4 +74,5 @@ def load_settings() -> Settings:
         orphan_timeout=_coerce_float(raw.get("orphan_timeout"), defaults.orphan_timeout),
         bootstrap_max_chars=_coerce_int(raw.get("bootstrap_max_chars"), defaults.bootstrap_max_chars),
         identity_append=_coerce_str(raw.get("identity_append"), defaults.identity_append),
+        idle_session_ttl=idle_session_ttl,
     )

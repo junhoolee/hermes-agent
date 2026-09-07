@@ -71,7 +71,20 @@ def args_key(args: dict | None) -> str:
 
 @dataclass
 class _Turn:
-    """One open Hermes<->SDK turn, keyed by session_key in ``ClaudeSubClient``."""
+    """One open Hermes<->SDK turn, keyed by session_key in ``ClaudeSubClient``.
+
+    ``state`` tracks where this turn sits in its lifecycle: ``"open"`` while
+    a drain (``run_turn``/``continue_turn``) is in flight, ``"paused"`` after
+    a ``tool_calls`` response has been handed back and Hermes core's
+    continuation is awaited, and ``"idle"`` after a ``stop`` when the
+    underlying ``SdkSession`` (and its CLI subprocess) is being kept warm for
+    a possible follow-up turn on the same conversation (v0.1-E). The
+    ``model``/``reasoning_effort``/``tools_key``/``system_hash`` fields pin
+    the parameters an idle session was opened with so a warm follow-up can be
+    refused the moment any of them changes; ``seen_count``/``last_reply_text``
+    let ``_is_warm_followup`` verify Hermes core's history still matches what
+    this session actually said before trusting a warm reuse.
+    """
 
     session: Any
     start_timeout: float
@@ -85,11 +98,83 @@ class _Turn:
     lock: threading.RLock = field(default_factory=threading.RLock)
     opened_at: float = field(default_factory=time.monotonic)
     orphan_timer: Any = None
+    state: str = "open"
+    model: str | None = None
+    reasoning_effort: str | None = None
+    tools_key: str | None = None
+    system_hash: str | None = None
+    seen_count: int = 0
+    last_reply_text: str = ""
+    idle_timer: Any = None
+    has_session_id: bool = False
 
 
 def _derive_session_key(system_text: str, first_user_text: str) -> str:
     digest = hashlib.sha1(f"{system_text}\x00{first_user_text}".encode()).hexdigest()
     return digest[:16]
+
+
+def _tools_key(tools: list[dict] | None) -> str:
+    """Stable key for the tool set a turn was opened with (order-independent)."""
+    if not tools:
+        return "none"
+    names = sorted(
+        (tool.get("function") or {}).get("name", "") for tool in tools if isinstance(tool, dict)
+    )
+    return hashlib.sha1("\x00".join(names).encode()).hexdigest()
+
+
+def _system_hash(system_text: str) -> str:
+    return hashlib.sha1((system_text or "").encode()).hexdigest()
+
+
+def _is_warm_followup(
+    messages: list[dict],
+    turn: "_Turn",
+    *,
+    model: str | None,
+    reasoning_effort: str | None,
+    tools: list[dict] | None,
+    extra_body: dict | None,
+) -> bool:
+    """True when *messages* is exactly this idle turn's history plus new user text.
+
+    Every check below must pass — any mismatch is treated as a cold start
+    (safety over reuse). See ``_Turn`` and D35-5 in the v0.1-E design notes.
+    """
+    if not (isinstance(extra_body, dict) and extra_body.get("hermes_session_id")):
+        logger.info("claude-sub: warm=False reason=no_session_id")
+        return False
+    if len(messages) <= turn.seen_count:
+        logger.info("claude-sub: warm=False reason=no_new_messages")
+        return False
+    prev = messages[turn.seen_count - 1]
+    if not isinstance(prev, dict) or prev.get("role") != "assistant":
+        logger.info("claude-sub: warm=False reason=history_mismatch")
+        return False
+    if convert.text_from_content(prev.get("content")).strip() != turn.last_reply_text:
+        logger.info("claude-sub: warm=False reason=history_mismatch")
+        return False
+    tail = messages[turn.seen_count :]
+    if not tail or any(
+        not isinstance(message, dict) or message.get("role") != "user" for message in tail
+    ):
+        logger.info("claude-sub: warm=False reason=history_mismatch")
+        return False
+    system_text, _last_user_text, _prior = convert.split_messages(messages)
+    if _system_hash(system_text) != turn.system_hash:
+        logger.info("claude-sub: warm=False reason=system_changed")
+        return False
+    if model != turn.model:
+        logger.info("claude-sub: warm=False reason=model_changed")
+        return False
+    if reasoning_effort != turn.reasoning_effort:
+        logger.info("claude-sub: warm=False reason=reasoning_changed")
+        return False
+    if _tools_key(tools) != turn.tools_key:
+        logger.info("claude-sub: warm=False reason=tools_changed")
+        return False
+    return True
 
 
 def _note_tool_blocks(turn: _Turn, tool_blocks: list) -> list:
@@ -369,6 +454,7 @@ class _StreamingProjector:
         self.last_call_usage: dict | None = None
         self.result_message: Any = None
         self.tool_calls: list[tuple[str, str, str]] | None = None
+        self.text_parts: list[str] = []
         self._streamed_text = False
 
     def __call__(self, message: Any) -> None:
@@ -383,6 +469,7 @@ class _StreamingProjector:
                 text = delta.get("text") or ""
                 if text:
                     self._streamed_text = True
+                    self.text_parts.append(text)
                     self.chunk_queue.put(_data_chunk(self.model, content=text))
             elif delta_type == "thinking_delta":
                 thinking = delta.get("thinking") or ""
@@ -400,6 +487,7 @@ class _StreamingProjector:
                     if not self._streamed_text:
                         text = getattr(block, "text", "") or ""
                         if text:
+                            self.text_parts.append(text)
                             self.chunk_queue.put(_data_chunk(self.model, content=text))
                 elif block_kind == "ToolUseBlock" and self.expect_tools:
                     name = getattr(block, "name", "") or ""
@@ -481,6 +569,7 @@ class ClaudeSubClient:
         if turn.orphan_timer is not None:
             turn.orphan_timer.cancel()
             turn.orphan_timer = None
+        self._cancel_idle_timer(turn)
         turn.session.request_interrupt()
         with turn.lock:
             pending = list(turn.pending.values())
@@ -518,6 +607,55 @@ class ClaudeSubClient:
         timer.daemon = True
         turn.orphan_timer = timer
         timer.start()
+
+    def _cancel_idle_timer(self, turn: _Turn) -> None:
+        if turn.idle_timer is not None:
+            turn.idle_timer.cancel()
+            turn.idle_timer = None
+
+    def _arm_idle_timer(self, session_key: str, turn: _Turn) -> None:
+        def _on_idle_expired() -> None:
+            with self._turns_lock:
+                if self._turns.get(session_key) is not turn or turn.state != "idle":
+                    return
+                self._turns.pop(session_key, None)
+            logger.info(
+                "claude-sub: session_key=%s idle session TTL expired; closing", session_key
+            )
+            turn.session.close()
+
+        timer = threading.Timer(self._settings.idle_session_ttl, _on_idle_expired)
+        timer.daemon = True
+        turn.idle_timer = timer
+        timer.start()
+
+    def _on_turn_stopped(
+        self, turn: _Turn, session_key: str, *, messages: list[dict], final_text: str
+    ) -> None:
+        """Handle a clean ``stop``: keep the session warm (idle) or close it.
+
+        A session is kept warm only when Hermes core gave it an explicit
+        ``hermes_session_id`` (so we know a follow-up will address it by the
+        same key — see D35-2) and warm retention is enabled
+        (``idle_session_ttl > 0``). Otherwise this preserves the v0.1-D
+        behavior of closing the session immediately.
+        """
+        settings = self._settings
+        if turn.has_session_id and settings.idle_session_ttl > 0:
+            turn.seen_count = len(messages) + 1
+            turn.last_reply_text = (final_text or "").strip()
+            turn.state = "idle"
+            self._arm_idle_timer(session_key, turn)
+            logger.info(
+                "claude-sub: session_key=%s turn idle (session kept warm), ttl=%.0fs",
+                session_key,
+                settings.idle_session_ttl,
+            )
+            return
+        with self._turns_lock:
+            if self._turns.get(session_key) is turn:
+                self._turns.pop(session_key, None)
+        turn.session.close()
 
     def _resolve_pending(self, turn: _Turn, tail: list[dict]) -> None:
         for message in tail:
@@ -584,9 +722,20 @@ class ClaudeSubClient:
         tools: list[dict] | None,
         model: str | None,
         reasoning_effort: str | None,
+        has_session_id: bool,
+        system_text: str,
     ) -> _Turn:
         settings = self._settings
-        turn = _Turn(session=None, start_timeout=settings.start_timeout)
+        turn = _Turn(
+            session=None,
+            start_timeout=settings.start_timeout,
+            state="open",
+            model=model,
+            reasoning_effort=reasoning_effort,
+            tools_key=_tools_key(tools),
+            system_hash=_system_hash(system_text),
+            has_session_id=has_session_id,
+        )
         mcp_servers = None
         allowed_tools = None
         hooks = None
@@ -645,13 +794,22 @@ class ClaudeSubClient:
         choice = SimpleNamespace(message=assistant_message, finish_reason="tool_calls")
         return SimpleNamespace(choices=[choice], usage=usage, model=model or "claude-sub")
 
-    def _finish(self, turn: _Turn, projector, session_key: str, *, model: str | None) -> Any:
+    def _finish(
+        self,
+        turn: _Turn,
+        projector,
+        session_key: str,
+        *,
+        model: str | None,
+        messages: list[dict],
+    ) -> Any:
         if projector.tool_calls is not None:
             logger.info(
                 "claude-sub: session_key=%s returning tool_calls response (%d call(s)); turn left open",
                 session_key,
                 len(projector.tool_calls),
             )
+            turn.state = "paused"
             self._arm_orphan_timer(session_key, turn)
             return self._build_tool_calls_completion(projector, model=model)
         if projector.result_message is not None:
@@ -662,10 +820,8 @@ class ClaudeSubClient:
                 reason = "rate-limit" if status == 429 else "error"
                 errors.raise_status(status, errors.error_message_for(reason, result_text))
         logger.info("claude-sub: session_key=%s turn finished (finish_reason=stop)", session_key)
-        with self._turns_lock:
-            if self._turns.get(session_key) is turn:
-                self._turns.pop(session_key, None)
-        turn.session.close()
+        final_text = "".join(projector.text_parts)
+        self._on_turn_stopped(turn, session_key, messages=messages, final_text=final_text)
         return self._build_stop_completion(projector, model=model)
 
     # ---------- streaming ----------
@@ -680,6 +836,7 @@ class ClaudeSubClient:
         model: str,
         settings: Any,
         expect_tools: bool,
+        messages: list[dict],
     ):
         chunk_queue: "queue.Queue" = queue.Queue()
         projector = _StreamingProjector(
@@ -755,12 +912,11 @@ class ClaudeSubClient:
                 self._discard_turn(session_key, turn)
                 errors.raise_status(result_holder["mapped_status"], result_holder["mapped_message"])
             if projector.tool_calls is not None:
+                turn.state = "paused"
                 self._arm_orphan_timer(session_key, turn)
             else:
-                with self._turns_lock:
-                    if self._turns.get(session_key) is turn:
-                        self._turns.pop(session_key, None)
-                turn.session.close()
+                final_text = "".join(projector.text_parts)
+                self._on_turn_stopped(turn, session_key, messages=messages, final_text=final_text)
 
         return _generator()
 
@@ -791,12 +947,26 @@ class ClaudeSubClient:
         messages = messages or []
         settings = self._settings
         session_key = self._resolve_session_key(messages, extra_body)
+        has_session_id = isinstance(extra_body, dict) and bool(extra_body.get("hermes_session_id"))
 
         with self._turns_lock:
             turn = self._turns.get(session_key)
 
-        tail = _classify_continuation(messages, turn)
+        tail = None
+        if turn is not None and turn.state == "paused":
+            tail = _classify_continuation(messages, turn)
         is_continuation = tail is not None
+
+        is_warm_followup = False
+        if not is_continuation and turn is not None and turn.state == "idle":
+            is_warm_followup = _is_warm_followup(
+                messages,
+                turn,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                tools=tools,
+                extra_body=extra_body,
+            )
 
         prompt: str | None = None
         if is_continuation:
@@ -804,18 +974,34 @@ class ClaudeSubClient:
             if turn.orphan_timer is not None:
                 turn.orphan_timer.cancel()
                 turn.orphan_timer = None
+            turn.state = "open"
+        elif is_warm_followup:
+            self._cancel_idle_timer(turn)
+            turn.state = "open"
+            tail_messages = messages[turn.seen_count :]
+            prompt = "\n\n".join(
+                convert.text_from_content(message.get("content")) for message in tail_messages
+            )
         else:
             if turn is not None:
                 self._discard_turn(session_key, turn)
             prompt = convert.build_prompt(messages, bootstrap_max_chars=settings.bootstrap_max_chars)
+            system_text, _last_user_text, _prior = convert.split_messages(messages)
             turn = self._open_new_turn(
-                session_key, tools=tools, model=model, reasoning_effort=reasoning_effort
+                session_key,
+                tools=tools,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                has_session_id=has_session_id,
+                system_text=system_text,
             )
 
         logger.info(
-            "claude-sub: create() session_key=%s continuation=%s tools=%s stream=%s",
+            "claude-sub: create() session_key=%s continuation=%s warm=%s state=%s tools=%s stream=%s",
             session_key,
             is_continuation,
+            is_warm_followup,
+            turn.state,
             bool(tools),
             stream,
         )
@@ -829,6 +1015,7 @@ class ClaudeSubClient:
                 model=model or "claude-sub",
                 settings=settings,
                 expect_tools=bool(tools),
+                messages=messages,
             )
 
         projector = _InversionProjector(turn=turn, expect_tools=bool(tools))
@@ -855,7 +1042,7 @@ class ClaudeSubClient:
             self._discard_turn(session_key, turn)
             errors.raise_status(503, errors.error_message_for("sdk-error", str(exc)))
 
-        return self._finish(turn, projector, session_key, model=model)
+        return self._finish(turn, projector, session_key, model=model, messages=messages)
 
 
 def _make_on_pre_tool_use(turn: _Turn):

@@ -251,7 +251,10 @@ class TestSingleToolRoundTrip:
         assert second.usage.prompt_tokens == 60
         assert second.usage.completion_tokens == 8
         assert calls_log[-1] == ("continue_turn", None)
-        assert closed_flag["closed"] is True
+        # v0.1-E: a session opened with an explicit hermes_session_id is kept
+        # warm (idle) after a clean stop, not closed — see test_warm_session.py.
+        assert closed_flag["closed"] is False
+        assert client._turns["sess-1"].state == "idle"
 
     def test_parallel_tool_calls_both_resolved_in_one_continuation(
         self, monkeypatch, client_module, session_module, closed_flag
