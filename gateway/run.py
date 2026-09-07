@@ -28608,6 +28608,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Failed to release active session slot", exc_info=True
                     )
+            # A mid-turn _evict_cached_agent() call couldn't soft-release
+            # this agent (it was still running), so it flagged the agent
+            # instead and deferred the release to right here, the turn's
+            # actual end. Run it now, on a daemon thread — release_clients()
+            # can do socket teardown we must not do on the gateway's own
+            # request thread. Skip if the agent has since been re-cached
+            # (e.g. the eviction lost a race with a fresh cache insert for
+            # the same session) — that agent must stay alive.
+            _turn_agent = state.turn.agent
+            if (
+                _turn_agent is not None
+                and _turn_agent is not _AGENT_PENDING_SENTINEL
+                and getattr(_turn_agent, "_gateway_deferred_soft_release", False)
+            ):
+                _cache = getattr(self, "_agent_cache", None)
+                _cache_lock = getattr(self, "_agent_cache_lock", None)
+                _recached = False
+                if _cache is not None and _cache_lock is not None:
+                    with _cache_lock:
+                        _recached = any(
+                            isinstance(entry, tuple) and entry and entry[0] is _turn_agent
+                            for entry in _cache.values()
+                        )
+                if not _recached:
+                    _turn_agent._gateway_deferred_soft_release = False
+                    try:
+                        threading.Thread(
+                            target=self._release_evicted_agent_soft,
+                            args=(_turn_agent,),
+                            daemon=True,
+                            name=f"agent-deferred-evict-{str(session_key)[:24]}",
+                        ).start()
+                    except Exception:
+                        try:
+                            self._release_evicted_agent_soft(_turn_agent)
+                        except Exception:
+                            pass
             # One structured reset instead of the old drifting pop-list
             # (agent / started_ts / lease / busy_ack_ts).  Turn-lease tokens
             # are deliberately NOT cleared here — _release_turn_lease owns
@@ -29183,12 +29220,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Don't tear down an agent that's actively mid-turn — its client,
         # sandbox and child subagents are in use by the running request.
+        # The soft release isn't skipped outright though: it's deferred to
+        # turn end (_release_running_agent_state), because a mid-turn evict
+        # (e.g. a fallback tier switching models) otherwise pops the agent
+        # out of _agent_cache with nothing left holding a reference to it —
+        # release_clients() / _release_claude_agent_sdk_session() never run,
+        # and the orphaned claude_agent_sdk session's daemon event-loop
+        # thread pins both the Python object and its claude CLI subprocess
+        # forever (#93441).
         running_ids = {
             id(a)
             for _, a in self._running_agent_items()
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
         if id(agent) in running_ids:
+            agent._gateway_deferred_soft_release = True
+            logger.debug(
+                "Agent evicted mid-turn for session %s; soft release deferred to turn end",
+                session_key,
+            )
             return
 
         try:
