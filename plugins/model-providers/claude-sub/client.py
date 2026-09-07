@@ -14,9 +14,28 @@ until the *next* tool call. ``create()`` inverts control between the two:
   bridge's waiting Futures and resumes draining the *same* SDK turn — no
   new ``query()`` — until the next pause or the final ``ResultMessage``.
 
-See ``bridge.py`` for the in-process MCP server + Future plumbing, and
-``session.py`` for the pause/continue primitive this relies on
-(``PauseTurn`` / ``continue_turn``).
+v0.1-D: a ``ToolUseBlock`` is turned into a ``tool_calls`` response the
+*instant* the projector sees it — no polling, no timeout, no wait of any
+kind. The SDK's own control channel invokes the matching bridge handler
+(``on_call``, via ``bridge.py``) on a separate thread with no ordering
+guarantee relative to the projector seeing the block; binding the two
+together (and the eventual tool result) is handled entirely by matching on
+``(name, args)`` — via the ``PreToolUse``/``PostToolUse`` hooks
+(``bridge.build_hooks``), via whichever of ``on_call``/the block arrives
+second consulting whichever arrived first, or, if the block is sent to
+Hermes core before the handler ever runs, by stashing the eventual
+continuation result until the handler catches up. See ``_note_tool_blocks``
+and ``_make_on_call`` below for the full reconciliation, and ``session.py``
+for the pause/continue primitive this relies on (``PauseTurn`` /
+``continue_turn``).
+
+Earlier revisions of this module (see git history for v0.1-C and prior) had
+the projector block on a short poll for the handler to register before
+returning — that design was fundamentally unsound (a bridge handler for a
+block that is never actually invoked is not a bug case, it's how the CLI's
+own ``ToolSearch``-driven internal tool resolution normally behaves — see
+``bridge.PASSTHROUGH_TOOLS`` and D34's ``cli_resolved``) and is gone here,
+not just retried with a longer timeout.
 """
 
 from __future__ import annotations
@@ -44,16 +63,10 @@ MARKER_BASE_URL = "claude-sub://sdk"
 
 _STREAM_DONE = object()
 
-# Upper bound for reconciling a bridge handler call against its matching
-# tool-use block when they arrive out of order (see ``_wait_for_pending``).
-# Deliberately independent of ``settings.start_timeout`` (SDK session
-# connect timeout) — this is a same-process handoff, not a subprocess
-# startup, so it should resolve in milliseconds, not tens of seconds.
-BRIDGE_BIND_TIMEOUT = 10.0
 
-
-class BridgeBindTimeout(RuntimeError):
-    """A bridge handler call and its tool-use block never reconciled in time."""
+def args_key(args: dict | None) -> str:
+    """Stable string key for matching a handler call against a tool-use block."""
+    return json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
 
 
 @dataclass
@@ -63,8 +76,12 @@ class _Turn:
     session: Any
     start_timeout: float
     pending: dict = field(default_factory=dict)  # call_id -> concurrent.futures.Future
-    expected_ids: list = field(default_factory=list)  # ordered [(call_id, name), ...]
-    unbound: list = field(default_factory=list)  # ordered [(name, Future), ...]
+    outstanding: dict = field(default_factory=dict)  # call_id -> (name, args_key)
+    hook_seen: list = field(default_factory=list)  # [(tool_use_id, name, args_key), ...]
+    unbound: list = field(default_factory=list)  # [(name, args_key, Future), ...]
+    results: dict = field(default_factory=dict)  # call_id -> stashed tool-result payload
+    handled_ids: set = field(default_factory=set)  # call ids an actual handler ran for
+    cli_resolved: set = field(default_factory=set)  # call ids the CLI resolved itself
     lock: threading.RLock = field(default_factory=threading.RLock)
     opened_at: float = field(default_factory=time.monotonic)
     orphan_timer: Any = None
@@ -75,76 +92,102 @@ def _derive_session_key(system_text: str, first_user_text: str) -> str:
     return digest[:16]
 
 
-def _register_expected(turn: _Turn, tool_blocks: list) -> None:
-    """Match each tool-use *block* against a bridge handler call, either way round.
+def _note_tool_blocks(turn: _Turn, tool_blocks: list) -> list:
+    """Register each tool-use *block* and return the subset to send to Hermes core.
 
-    Handler and projector run on different threads and there is no
-    guarantee which one reaches its half of the pair first (the SDK spawns
-    the MCP tool call as soon as it appears on the control channel, often
-    before the drain thread has projected the matching ``AssistantMessage``
-    block — see the module docstring). If ``on_call`` already parked a
-    Future for this block's short name in ``turn.unbound``, claim it
-    directly into ``pending``; otherwise queue the expectation for
-    ``on_call`` to find when it runs.
+    Called the instant the projector sees the blocks — no waiting. If a
+    bridge handler already parked a Future in ``turn.unbound`` for this
+    block's ``(name, args)`` (the handler-arrived-first race), claim it
+    into ``pending`` right away; either way the block's id is recorded in
+    ``turn.outstanding`` so a same-thread-later ``on_call`` invocation (the
+    far more common block-arrived-first race, since the SDK's control
+    channel only starts a handler once it has fully dispatched the tool
+    call) can find it.
+
+    A block whose id is already in ``turn.cli_resolved`` (the CLI itself
+    resolved that call — see ``bridge.build_hooks``'s ``PostToolUse``
+    wiring — meaning no handler will ever run for it, e.g. an internal
+    ``ToolSearch`` follow-up) is dropped: it is never sent to Hermes core.
     """
+    sendable = []
     with turn.lock:
         for block in tool_blocks:
             name = getattr(block, "name", "") or ""
-            short_name = name[len(BRIDGE_PREFIX):] if name.startswith(BRIDGE_PREFIX) else name
+            short_name = name[len(BRIDGE_PREFIX) :] if name.startswith(BRIDGE_PREFIX) else name
             call_id = getattr(block, "id", None)
+            if call_id in turn.cli_resolved:
+                logger.info(
+                    "claude-sub: tool_use block %s (%s) already resolved by the CLI itself; "
+                    "not sending to Hermes core",
+                    call_id,
+                    short_name,
+                )
+                continue
+            key = args_key(getattr(block, "input", None))
             fut = None
-            for index, (unbound_name, unbound_fut) in enumerate(turn.unbound):
-                if unbound_name == short_name:
-                    fut = unbound_fut
+            for index, (u_name, u_key, u_fut) in enumerate(turn.unbound):
+                if u_name == short_name and u_key == key:
+                    fut = u_fut
                     del turn.unbound[index]
                     break
+            if fut is None:
+                for index, (u_name, _u_key, u_fut) in enumerate(turn.unbound):
+                    if u_name == short_name:
+                        fut = u_fut
+                        del turn.unbound[index]
+                        break
             if fut is not None:
                 turn.pending[call_id] = fut
-            else:
-                turn.expected_ids.append((call_id, short_name))
-
-
-def _wait_for_pending(turn: _Turn, ids: list) -> None:
-    """Block (briefly) until *ids* all have a Future registered in pending.
-
-    ``on_call`` and ``_register_expected`` reconcile handler-first and
-    projector-first arrival against each other under ``turn.lock`` (see
-    their docstrings), so by the time either side reaches this call, *ids*
-    should already be bound — this is a short poll for the remaining
-    in-flight window between the two. Bounded by ``BRIDGE_BIND_TIMEOUT`` so
-    a genuinely wedged handler can't hang the pump forever.
-    """
-    deadline = time.monotonic() + BRIDGE_BIND_TIMEOUT
-    while True:
-        with turn.lock:
-            if all(i in turn.pending for i in ids):
-                return
-        if time.monotonic() >= deadline:
-            logger.warning(
-                "claude-sub: timed out waiting for bridge handler registration for %s", ids
-            )
-            raise BridgeBindTimeout(
-                f"claude-sub: bridge handler registration timed out for {ids}"
-            )
-        time.sleep(0.01)
+                turn.handled_ids.add(call_id)
+            turn.outstanding[call_id] = (short_name, key)
+            sendable.append(block)
+    return sendable
 
 
 def _make_on_call(turn: _Turn):
-    def on_call(name: str, _args: dict) -> "concurrent.futures.Future":
+    def on_call(name: str, args: dict) -> "concurrent.futures.Future":
+        key = args_key(args)
         fut: "concurrent.futures.Future" = concurrent.futures.Future()
         with turn.lock:
             call_id = None
-            for index, (cid, expected_name) in enumerate(turn.expected_ids):
-                if expected_name == name:
-                    call_id = cid
-                    del turn.expected_ids[index]
+            for index, (tool_use_id, hook_name, hook_key) in enumerate(turn.hook_seen):
+                if hook_name == name and hook_key == key:
+                    call_id = tool_use_id
+                    del turn.hook_seen[index]
                     break
+            if call_id is None:
+                candidates = [
+                    (cid, o_name, o_key)
+                    for cid, (o_name, o_key) in turn.outstanding.items()
+                    if cid not in turn.pending and cid not in turn.handled_ids
+                ]
+                for cid, o_name, o_key in candidates:
+                    if o_name == name and o_key == key:
+                        call_id = cid
+                        break
+                if call_id is None:
+                    for cid, o_name, _o_key in candidates:
+                        if o_name == name:
+                            call_id = cid
+                            break
             if call_id is not None:
-                turn.pending[call_id] = fut
+                turn.handled_ids.add(call_id)
+                stashed = turn.results.pop(call_id, None)
+                if stashed is not None:
+                    logger.info(
+                        "claude-sub: bridge handler for %s (%s) found a stashed continuation "
+                        "result; resolving immediately",
+                        name,
+                        call_id,
+                    )
+                    fut.set_result(stashed)
+                else:
+                    turn.pending[call_id] = fut
             else:
-                turn.unbound.append((name, fut))
+                turn.unbound.append((name, key, fut))
                 logger.debug(
-                    "claude-sub: bridge handler for %s arrived before its tool_use block; parking",
+                    "claude-sub: bridge handler for %s arrived unbound (no matching hook_seen "
+                    "or outstanding entry yet); parking",
                     name,
                 )
         return fut
@@ -157,8 +200,8 @@ def _classify_continuation(messages: list[dict], turn: "_Turn | None") -> list[d
     if turn is None:
         return None
     with turn.lock:
-        pending_ids = set(turn.pending.keys())
-    if not pending_ids:
+        outstanding_ids = set(turn.outstanding.keys())
+    if not outstanding_ids:
         return None
 
     last_assistant_idx = None
@@ -188,7 +231,7 @@ def _classify_continuation(messages: list[dict], turn: "_Turn | None") -> list[d
             return None
         tail_ids.add(call_id)
 
-    if tail_ids != assistant_ids or tail_ids != pending_ids:
+    if tail_ids != assistant_ids or tail_ids != outstanding_ids:
         return None
     return tail
 
@@ -227,18 +270,21 @@ class _InversionProjector:
                     if name.startswith(BRIDGE_PREFIX):
                         tool_blocks.append(block)
             if tool_blocks:
-                _register_expected(self.turn, tool_blocks)
-                ids = [getattr(b, "id", None) for b in tool_blocks]
-                _wait_for_pending(self.turn, ids)
-                self.tool_calls = [
-                    (
-                        getattr(block, "id", None),
-                        getattr(block, "name", "")[len(BRIDGE_PREFIX):],
-                        json.dumps(getattr(block, "input", None) or {}, ensure_ascii=False),
+                sendable = _note_tool_blocks(self.turn, tool_blocks)
+                if sendable:
+                    self.tool_calls = [
+                        (
+                            getattr(block, "id", None),
+                            getattr(block, "name", "")[len(BRIDGE_PREFIX) :],
+                            json.dumps(getattr(block, "input", None) or {}, ensure_ascii=False),
+                        )
+                        for block in sendable
+                    ]
+                    logger.info(
+                        "claude-sub: tool_calls ready ids=%s",
+                        [call_id for call_id, _name, _args in self.tool_calls],
                     )
-                    for block in tool_blocks
-                ]
-                raise PauseTurn()
+                    raise PauseTurn()
         elif kind == "ResultMessage":
             self.result_message = message
 
@@ -360,20 +406,23 @@ class _StreamingProjector:
                     if name.startswith(BRIDGE_PREFIX):
                         tool_blocks.append(block)
             if tool_blocks:
-                _register_expected(self.turn, tool_blocks)
-                ids = [getattr(b, "id", None) for b in tool_blocks]
-                _wait_for_pending(self.turn, ids)
-                self.tool_calls = [
-                    (
-                        getattr(block, "id", None),
-                        getattr(block, "name", "")[len(BRIDGE_PREFIX):],
-                        json.dumps(getattr(block, "input", None) or {}, ensure_ascii=False),
+                sendable = _note_tool_blocks(self.turn, tool_blocks)
+                if sendable:
+                    self.tool_calls = [
+                        (
+                            getattr(block, "id", None),
+                            getattr(block, "name", "")[len(BRIDGE_PREFIX) :],
+                            json.dumps(getattr(block, "input", None) or {}, ensure_ascii=False),
+                        )
+                        for block in sendable
+                    ]
+                    logger.info(
+                        "claude-sub: tool_calls ready ids=%s",
+                        [call_id for call_id, _name, _args in self.tool_calls],
                     )
-                    for block in tool_blocks
-                ]
-                self.chunk_queue.put(_tool_calls_delta_chunk(self.model, self.tool_calls))
-                self.chunk_queue.put(_usage_chunk(self.model, self.last_call_usage))
-                raise PauseTurn()
+                    self.chunk_queue.put(_tool_calls_delta_chunk(self.model, self.tool_calls))
+                    self.chunk_queue.put(_usage_chunk(self.model, self.last_call_usage))
+                    raise PauseTurn()
         elif kind == "ResultMessage":
             self.result_message = message
 
@@ -435,10 +484,14 @@ class ClaudeSubClient:
         turn.session.request_interrupt()
         with turn.lock:
             pending = list(turn.pending.values())
-            unbound = [fut for _name, fut in turn.unbound]
+            unbound = [fut for _name, _key, fut in turn.unbound]
             turn.pending.clear()
-            turn.expected_ids.clear()
+            turn.outstanding.clear()
+            turn.hook_seen.clear()
             turn.unbound.clear()
+            turn.results.clear()
+            turn.handled_ids.clear()
+            turn.cli_resolved.clear()
         for fut in pending:
             fut.cancel()
         for fut in unbound:
@@ -469,13 +522,24 @@ class ClaudeSubClient:
     def _resolve_pending(self, turn: _Turn, tail: list[dict]) -> None:
         for message in tail:
             call_id = message.get("tool_call_id")
+            text = convert.text_from_content(message.get("content"))
+            payload = {"content": [{"type": "text", "text": text}], "is_error": False}
             with turn.lock:
                 fut = turn.pending.pop(call_id, None)
-            if fut is None or fut.done():
-                continue
-            text = convert.text_from_content(message.get("content"))
-            logger.info("claude-sub: continuation resolving pending tool call %s", call_id)
-            fut.set_result({"content": [{"type": "text", "text": text}], "is_error": False})
+            if fut is not None:
+                if fut.done():
+                    continue
+                logger.info("claude-sub: continuation resolving pending tool call %s", call_id)
+                fut.set_result(payload)
+            else:
+                with turn.lock:
+                    turn.results[call_id] = payload
+                logger.info(
+                    "claude-sub: continuation result for %s stashed; handler not invoked yet",
+                    call_id,
+                )
+        with turn.lock:
+            turn.outstanding.clear()
 
     def _build_session(
         self,
@@ -529,7 +593,10 @@ class ClaudeSubClient:
         if tools:
             server, allowed_tools = bridge.build_bridge(tools, _make_on_call(turn))
             mcp_servers = {"hermes": server}
-            hooks = bridge.build_pretooluse_hooks()
+            hooks = bridge.build_hooks(
+                on_pre_tool_use=_make_on_pre_tool_use(turn),
+                on_post_tool_use=_make_on_post_tool_use(turn),
+            )
         turn.session = self._build_session(
             model=model,
             reasoning_effort=reasoning_effort,
@@ -789,6 +856,36 @@ class ClaudeSubClient:
             errors.raise_status(503, errors.error_message_for("sdk-error", str(exc)))
 
         return self._finish(turn, projector, session_key, model=model)
+
+
+def _make_on_pre_tool_use(turn: _Turn):
+    def on_pre_tool_use(tool_use_id: str, short_name: str, tool_input: dict) -> None:
+        key = args_key(tool_input)
+        with turn.lock:
+            turn.hook_seen.append((tool_use_id, short_name, key))
+
+    return on_pre_tool_use
+
+
+def _make_on_post_tool_use(turn: _Turn):
+    def on_post_tool_use(tool_use_id: str, short_name: str, tool_response: Any, failed: bool) -> None:
+        summary = repr(tool_response)
+        if len(summary) > 200:
+            summary = summary[:200] + "…"
+        with turn.lock:
+            handled = tool_use_id in turn.handled_ids
+            if not handled:
+                turn.cli_resolved.add(tool_use_id)
+        logger.info(
+            "claude-sub: PostToolUse id=%s name=%s handled=%s failed=%s response=%s",
+            tool_use_id,
+            short_name,
+            handled,
+            failed,
+            summary,
+        )
+
+    return on_post_tool_use
 
 
 __all__ = ["ClaudeSubClient", "MARKER_BASE_URL"]

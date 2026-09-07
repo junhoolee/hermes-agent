@@ -6,7 +6,7 @@ Pro/Max/Team subscription without an ACP subprocess. Registers itself as an
 for the sibling pattern) and supplies its own client via
 `ProviderProfile.create_client()` — no core edits required.
 
-## Status: v0.1-C
+## Status: v0.1-D
 
 - v0.1-A (profile registration, settings, scrubbed child environment, error
   mapping, message→prompt conversion, synchronous one-shot session runner) plus:
@@ -19,23 +19,53 @@ for the sibling pattern) and supplies its own client via
   each tool-call boundary, returns an OpenAI-shaped `tool_calls` completion,
   and resumes the *same* SDK turn (no new `query()`) once Hermes core's
   follow-up `create()` call delivers the matching `tool` result messages.
-- **Bridge id binding** (v0.1-C): the SDK's MCP tool-call handler and the
-  drain thread's tool-use-block projection run on different threads with no
-  ordering guarantee — the handler can fire before or after its matching
-  block is projected. `client.py`'s `on_call`/`_register_expected` reconcile
-  whichever side arrives second against the other's parked state
-  (`turn.unbound` / `turn.expected_ids`) under `turn.lock`, replacing the
-  earlier "handler always arrives after its block" assumption (which
-  generated a throwaway id on mismatch and caused a mismatch-loop with
-  Hermes core re-issuing the same tool call). `_wait_for_pending` now raises
-  `BridgeBindTimeout` after `BRIDGE_BIND_TIMEOUT` (10s) instead of silently
-  returning, so a genuinely wedged handler surfaces as a mapped 503 instead
-  of an id mismatch. The claude CLI also defers loading MCP tool schemas
-  behind its own `ToolSearch` metatool; denying it like every other
-  non-bridge tool left the model unable to ever discover `mcp__hermes__*`
-  schemas at all, so it's now explicitly passed through (it only loads
-  schemas and never executes anything, so this doesn't weaken the deny
-  hook's "Hermes owns tool execution" contract).
+- **Bridge id binding, no wait** (v0.1-D): a `ToolUseBlock` becomes a
+  `tool_calls` response the *instant* the projector sees it — there is no
+  poll, no timeout, no wait on the matching bridge handler of any kind.
+  Earlier revisions (see git history) had the projector block on a short
+  poll for the SDK's MCP handler to register before returning; that design
+  was unsound at its root, not just too short a timeout — a block whose
+  handler never actually runs isn't a failure case, it's how the CLI's own
+  `ToolSearch`-driven internal tool resolution normally behaves (see
+  `turn.cli_resolved` below), and every such block eventually wedged the
+  poll, got discarded, and forced the whole CLI subprocess to restart from a
+  cold start — the reported symptom was a 20-minute loop of repeated cold
+  starts. The SDK's MCP tool-call handler thread and the drain thread's
+  tool-use-block projection still run concurrently with no ordering
+  guarantee between them, and now so does the `PreToolUse` hook that fires
+  before the handler; `client.py` reconciles all three purely by matching on
+  `(name, args)` — never by waiting for one to catch up with the other:
+  - `turn.hook_seen` — `PreToolUse` observations (`bridge.build_hooks`'s
+    `on_pre_tool_use`), consumed first by `on_call` if present.
+  - `turn.outstanding` — every call id sent to Hermes core as `tool_calls`,
+    consulted by `on_call` next (exact `(name, args)` match, falling back to
+    a `name`-only match for disambiguation-not-required cases).
+  - `turn.unbound` — a handler that reached `on_call` before its block was
+    ever projected parks here; `_note_tool_blocks` claims it the moment the
+    block shows up.
+  - `turn.results` — if Hermes core's continuation delivers a tool result
+    before any handler ever ran for that id (a `_note_tool_blocks`-only
+    block with no handler in flight yet), the result is stashed here and
+    handed straight to the handler's Future, already resolved, the moment
+    `on_call` eventually catches up.
+  - `turn.cli_resolved` — `PostToolUse`/`PostToolUseFailure` observations
+    (`on_post_tool_use`) mark a call id as resolved by the CLI itself when
+    no handler ever ran for it; `_note_tool_blocks` drops any further block
+    for that id instead of sending it to Hermes core.
+  All of this is under `turn.lock`; none of it blocks. The claude CLI also
+  defers loading MCP tool schemas behind its own `ToolSearch` metatool;
+  denying it like every other non-bridge tool left the model unable to ever
+  discover `mcp__hermes__*` schemas at all, so it's explicitly passed
+  through (it only loads schemas and never executes anything, so this
+  doesn't weaken the deny hook's "Hermes owns tool execution" contract).
+  To read the reconciliation from `agent.log`: `tool_calls ready ids=[...]`
+  logs the moment a block was sent (no wait happened first — timestamps
+  should be effectively simultaneous with the model's own tool-call
+  message), `PostToolUse id=... handled=... failed=... response=...` logs
+  every CLI-side tool-lifecycle observation (compare its `handled` flag
+  against whether a later `bridge handler invoked/resolved` line for the
+  same id shows up), and `continuation result for ... stashed; handler not
+  invoked yet` marks the (b)/(e) stash path above actually firing.
 - **Real streaming**: `create(stream=True)` returns a generator of
   OpenAI-shaped delta chunks (text, thinking/reasoning, then a `tool_calls`
   or `stop` chunk followed by a usage chunk), built off the SDK's

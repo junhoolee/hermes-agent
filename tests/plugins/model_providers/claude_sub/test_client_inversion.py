@@ -116,23 +116,31 @@ def _simulate_bridge_registration(monkeypatch, client_module):
     These tests replay a scripted, synchronous message sequence straight
     through ``on_message`` — there is no real ``claude_agent_sdk`` MCP
     dispatch running concurrently to actually invoke a bridge handler (that
-    path, including the real expected-id/name matching inside ``on_call``,
-    is covered by test_bridge.py's handler tests). Here, once
-    ``_register_expected`` has queued the expected ids for the AssistantMessage
-    just seen, register a Future for each directly — exercising client.py's
-    own contract (pump/classification/response shaping) without needing
-    threads or the real SDK.
+    path, including the real name+args_key matching inside ``on_call``, is
+    covered by test_bridge_binding.py). v0.1-D's projector no longer waits
+    for a handler at all — it returns ``tool_calls`` the instant it sees the
+    block, registering each id in ``turn.outstanding`` via
+    ``_note_tool_blocks``. Here, once that has happened for the
+    AssistantMessage just seen, bind a Future directly into ``turn.pending``
+    for each newly-outstanding id — exercising client.py's own contract
+    (pump/classification/response shaping) without needing threads or the
+    real SDK.
     """
     import concurrent.futures as cf
 
-    def _fake_wait_for_pending(turn, ids):
-        with turn.lock:
-            matched = [entry for entry in turn.expected_ids if entry[0] in ids]
-            for call_id, _name in matched:
-                turn.pending.setdefault(call_id, cf.Future())
-            turn.expected_ids[:] = [entry for entry in turn.expected_ids if entry[0] not in ids]
+    original = client_module._note_tool_blocks
 
-    monkeypatch.setattr(client_module, "_wait_for_pending", _fake_wait_for_pending)
+    def _wrapped(turn, tool_blocks):
+        sendable = original(turn, tool_blocks)
+        with turn.lock:
+            for block in sendable:
+                call_id = getattr(block, "id", None)
+                if call_id not in turn.pending:
+                    turn.pending[call_id] = cf.Future()
+                    turn.handled_ids.add(call_id)
+        return sendable
+
+    monkeypatch.setattr(client_module, "_note_tool_blocks", _wrapped)
 
 
 def _install_fake_session(monkeypatch, client_module, session_module, closed_flag, *, script=None, session_scripts=None):
@@ -154,14 +162,6 @@ def _install_fake_session(monkeypatch, client_module, session_module, closed_fla
 
 
 def _make_client(client_module):
-    """A client with a short ``start_timeout``.
-
-    These tests replay scripted SDK messages directly through
-    ``on_message`` without a real bridge handler ever calling ``on_call``
-    (that async-dispatch path is covered separately by test_bridge.py), so
-    ``_wait_for_pending`` always exhausts its wait here — keep the bound
-    short so that's milliseconds, not the real 60s default.
-    """
     client = client_module.ClaudeSubClient(api_key="claude-sub", base_url="claude-sub://sdk")
     client._settings = dataclasses.replace(client._settings, start_timeout=0.05)
     return client

@@ -177,14 +177,19 @@ def _simulate_bridge_registration(monkeypatch, client_module):
     """See test_client_inversion.py's fixture of the same name for why."""
     import concurrent.futures as cf
 
-    def _fake_wait_for_pending(turn, ids):
-        with turn.lock:
-            matched = [entry for entry in turn.expected_ids if entry[0] in ids]
-            for call_id, _name in matched:
-                turn.pending.setdefault(call_id, cf.Future())
-            turn.expected_ids[:] = [entry for entry in turn.expected_ids if entry[0] not in ids]
+    original = client_module._note_tool_blocks
 
-    monkeypatch.setattr(client_module, "_wait_for_pending", _fake_wait_for_pending)
+    def _wrapped(turn, tool_blocks):
+        sendable = original(turn, tool_blocks)
+        with turn.lock:
+            for block in sendable:
+                call_id = getattr(block, "id", None)
+                if call_id not in turn.pending:
+                    turn.pending[call_id] = cf.Future()
+                    turn.handled_ids.add(call_id)
+        return sendable
+
+    monkeypatch.setattr(client_module, "_note_tool_blocks", _wrapped)
 
 
 class TestOrphanWatchdog:

@@ -8,6 +8,13 @@ closure ``client.py`` supplies that returns a ``concurrent.futures.Future``
 delivers the real tool result on a later ``create()`` call. This module
 never touches Hermes' tool execution itself; it only relays.
 
+v0.1-D also wires ``PreToolUse``/``PostToolUse``/``PostToolUseFailure``
+into id-binding observation (see ``client.py``'s module docstring for why
+the bridge-handler-registration wait was removed): every bridge tool call
+now reports through here in *addition* to the deny gate, so ``client.py``
+can reconcile a handler call against its ``ToolUseBlock`` no matter which
+side of the race arrives first.
+
 The ``PreToolUse`` deny hook is adapted from
 ``agent/claude_runtime.py:253-284`` (a fork-only module this plugin cannot
 import, see AGENTS.md D4) — same pattern, copied rather than shared: deny
@@ -108,10 +115,7 @@ def build_bridge(
     return server, allowed_tool_names
 
 
-async def _deny_non_bridge_tool(hook_input: Any, _tool_use_id: Any, _context: Any) -> dict:
-    name = str((hook_input or {}).get("tool_name") or "")
-    if name.startswith(BRIDGE_PREFIX) or name in PASSTHROUGH_TOOLS:
-        return {}
+def _deny_result(name: str) -> dict:
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -124,11 +128,86 @@ async def _deny_non_bridge_tool(hook_input: Any, _tool_use_id: Any, _context: An
     }
 
 
-def build_pretooluse_hooks() -> dict[str, Any]:
-    """``PreToolUse`` hook dict that denies every non-bridge tool call."""
+def _short_name(name: str) -> str:
+    return name[len(BRIDGE_PREFIX) :] if name.startswith(BRIDGE_PREFIX) else name
+
+
+def build_hooks(
+    *,
+    on_pre_tool_use: Callable[[str, str, dict], None],
+    on_post_tool_use: Callable[[str, str, Any, bool], None],
+) -> dict[str, Any]:
+    """``PreToolUse``/``PostToolUse``/``PostToolUseFailure`` hook dict.
+
+    ``PreToolUse`` keeps the existing deny-everything-but-ours gate and,
+    for a bridge tool, additionally calls
+    ``on_pre_tool_use(tool_use_id, short_name, tool_input)`` so ``client.py``
+    can record the call in ``turn.hook_seen`` before the handler ever runs.
+    ``PostToolUse``/``PostToolUseFailure`` call
+    ``on_post_tool_use(tool_use_id, short_name, tool_response, failed)`` for
+    a bridge tool so ``client.py`` can tell whether the CLI resolved a call
+    id itself (no handler ever invoked for it — see ``turn.cli_resolved``).
+
+    Callback failures are logged and swallowed: a hook must always return a
+    real decision dict, never raise, or the CLI-side turn wedges.
+    """
     from claude_agent_sdk import HookMatcher
 
-    return {"PreToolUse": [HookMatcher(matcher=None, hooks=[_deny_non_bridge_tool])]}
+    async def _pre_tool_use(hook_input: Any, tool_use_id: Any, _context: Any) -> dict:
+        payload = hook_input or {}
+        name = str(payload.get("tool_name") or "")
+        if name in PASSTHROUGH_TOOLS:
+            return {}
+        if not name.startswith(BRIDGE_PREFIX):
+            return _deny_result(name)
+        try:
+            on_pre_tool_use(str(tool_use_id), _short_name(name), payload.get("tool_input") or {})
+        except Exception:
+            logger.debug("claude-sub: on_pre_tool_use callback failed", exc_info=True)
+        return {}
+
+    async def _post_tool_use(hook_input: Any, tool_use_id: Any, _context: Any) -> dict:
+        payload = hook_input or {}
+        name = str(payload.get("tool_name") or "")
+        if name.startswith(BRIDGE_PREFIX):
+            try:
+                on_post_tool_use(
+                    str(tool_use_id), _short_name(name), payload.get("tool_response"), False
+                )
+            except Exception:
+                logger.debug("claude-sub: on_post_tool_use callback failed", exc_info=True)
+        return {}
+
+    async def _post_tool_use_failure(hook_input: Any, tool_use_id: Any, _context: Any) -> dict:
+        payload = hook_input or {}
+        name = str(payload.get("tool_name") or "")
+        if name.startswith(BRIDGE_PREFIX):
+            try:
+                on_post_tool_use(str(tool_use_id), _short_name(name), payload.get("error"), True)
+            except Exception:
+                logger.debug("claude-sub: on_post_tool_use callback failed", exc_info=True)
+        return {}
+
+    return {
+        "PreToolUse": [HookMatcher(matcher=None, hooks=[_pre_tool_use])],
+        "PostToolUse": [HookMatcher(matcher=None, hooks=[_post_tool_use])],
+        "PostToolUseFailure": [HookMatcher(matcher=None, hooks=[_post_tool_use_failure])],
+    }
+
+
+def build_pretooluse_hooks() -> dict[str, Any]:
+    """Legacy wrapper — ``PreToolUse``-only deny gate, no id-binding observation.
+
+    Superseded by :func:`build_hooks`, which also wires the
+    ``PostToolUse``/``PostToolUseFailure`` observation callbacks
+    ``client.py``'s id-binding reconciliation relies on. Kept for any
+    caller that only wants the deny gate.
+    """
+    hooks = build_hooks(
+        on_pre_tool_use=lambda *_a, **_kw: None,
+        on_post_tool_use=lambda *_a, **_kw: None,
+    )
+    return {"PreToolUse": hooks["PreToolUse"]}
 
 
 __all__ = [
@@ -137,5 +216,6 @@ __all__ = [
     "PASSTHROUGH_TOOLS",
     "READ_ONLY",
     "build_bridge",
+    "build_hooks",
     "build_pretooluse_hooks",
 ]
