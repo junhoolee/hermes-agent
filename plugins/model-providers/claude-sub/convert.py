@@ -32,6 +32,17 @@ def _text_from_content(content: Any) -> str:
     return str(content)
 
 
+def text_from_content(content: Any) -> str:
+    """Public alias of the internal content-flattening helper.
+
+    Used by ``client.py`` to render a ``tool`` message's content back into
+    the ``{"content":[{"type":"text",...}]}`` shape a bridge Future resolves
+    to (D16) — the same text/``image_url``-omitted flattening every other
+    message already goes through.
+    """
+    return _text_from_content(content)
+
+
 def split_messages(messages: list[dict]) -> tuple[str, str, list[dict]]:
     """Split *messages* into (system_text, last_user_text, prior_messages).
 
@@ -174,4 +185,5 @@ __all__ = [
     "bootstrap_prefix",
     "build_prompt",
     "usage_from_assistant",
+    "text_from_content",
 ]

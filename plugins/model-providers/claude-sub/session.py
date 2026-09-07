@@ -1,13 +1,18 @@
-"""Synchronous one-shot session runner for the claude-sub provider.
+"""Synchronous session runner for the claude-sub provider.
 
 ``ClaudeSDKClient`` is asyncio-only; the plugin's ``ClaudeSubClient`` is
 synchronous. This module owns the bridge: one dedicated event-loop thread per
-``SdkSession``, driving a single ``ClaudeSDKClient`` connected with no tools
-(v0.1 — a tooled/streaming session is card B's job).
+``SdkSession``, driving a single ``ClaudeSDKClient``.
+
+v0.1-B adds pause/continue: an ``on_message`` callback can raise
+``PauseTurn`` to stop draining early (a tool-call boundary) while leaving the
+SDK turn open — the background pump keeps running and buffering further
+messages, and a later ``continue_turn()`` call resumes draining the same
+turn without issuing a new ``query()``.
 
 Adapted from ``agent/transports/claude_agent_session.py`` with the session
-store / resume / materialization machinery removed: this plugin runs each
-turn as a fresh one-tool-less session, never resumes a prior transcript.
+store / resume / materialization machinery removed: this plugin never
+resumes a prior transcript across process restarts.
 """
 
 from __future__ import annotations
@@ -35,6 +40,15 @@ class SdkSessionError(RuntimeError):
     """Raised for session-level failures (startup, teardown, wedged turn)."""
 
 
+class PauseTurn(Exception):
+    """Raised by an ``on_message`` callback to stop draining early.
+
+    The SDK turn stays open — the background pump keeps buffering further
+    messages into the same inbox. The caller retrieves them again via
+    ``continue_turn()`` rather than starting a fresh ``query()``.
+    """
+
+
 def is_result_message(message: Any) -> bool:
     """True when *message* is the SDK's terminal ``ResultMessage``.
 
@@ -52,8 +66,19 @@ def build_options(
     identity_append: str = "",
     cwd: Optional[str] = None,
     stderr: Optional[Callable[[str], None]] = None,
+    mcp_servers: Optional[dict] = None,
+    allowed_tools: Optional[list] = None,
+    hooks: Optional[dict] = None,
+    max_turns: Optional[int] = 1,
 ) -> Any:
-    """Build a tool-less, single-turn ``ClaudeAgentOptions`` for this plugin."""
+    """Build ``ClaudeAgentOptions`` for this plugin.
+
+    Two shapes: a tool-less single turn (``mcp_servers`` omitted — the
+    default, used for aux one-shot calls) and a bridged turn (``mcp_servers``
+    given — ``tools`` is deliberately left unspecified so the CLI's built-in
+    tool context stays intact for its billing classifier; a PreToolUse hook
+    is what actually keeps them from running, see ``bridge.py``).
+    """
     from claude_agent_sdk import ClaudeAgentOptions
 
     kwargs: dict = dict(
@@ -67,12 +92,19 @@ def build_options(
         cwd=cwd or os.getcwd(),
         env={},
         include_partial_messages=True,
-        allowed_tools=[],
-        tools=[],
-        max_turns=1,
-        mcp_servers={},
         stderr=stderr or (lambda line: logger.debug("claude-sub stderr: %s", line)),
     )
+    if mcp_servers:
+        kwargs["mcp_servers"] = mcp_servers
+        kwargs["allowed_tools"] = list(allowed_tools or [])
+        if hooks:
+            kwargs["hooks"] = hooks
+    else:
+        kwargs["mcp_servers"] = {}
+        kwargs["allowed_tools"] = []
+        kwargs["tools"] = []
+    if max_turns is not None:
+        kwargs["max_turns"] = max_turns
     if model:
         kwargs["model"] = model
     if reasoning_effort in _VALID_EFFORTS:
@@ -104,6 +136,11 @@ class SdkSession:
         self._client: Any = None
         self._closed = False
 
+        # An open, paused turn: the background pump keeps running and
+        # buffering into this inbox until continue_turn() drains it further.
+        self._pending_inbox: Optional["queue.Queue[tuple[str, Any]]"] = None
+        self._pending_future: Any = None
+
     @property
     def started(self) -> bool:
         return self._client is not None
@@ -111,6 +148,10 @@ class SdkSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def has_open_turn(self) -> bool:
+        return self._pending_inbox is not None
 
     def ensure_started(self) -> None:
         """Spawn the loop thread and connect the client. Idempotent."""
@@ -151,7 +192,12 @@ class SdkSession:
             self._closed = True
             client = self._client
             self._client = None
+            pending_future = self._pending_future
+            self._pending_inbox = None
+            self._pending_future = None
 
+        if pending_future is not None:
+            pending_future.cancel()
         if client is not None:
             try:
                 self._submit(client.disconnect(), timeout=self._close_timeout)
@@ -180,25 +226,74 @@ class SdkSession:
         stall_timeout: Optional[float] = None,
         stall_exempt: Optional[Callable[[], bool]] = None,
     ) -> int:
-        """Send *prompt* and block until the response stream goes quiet.
+        """Send *prompt* (a fresh ``query()``) and drain until quiet or paused.
 
-        Returns the number of messages delivered. Raises ``TimeoutError`` on a
-        blown deadline or a stall, and re-raises whatever the SDK raised.
+        Raises ``TimeoutError`` on a blown deadline or a stall, and re-raises
+        whatever the SDK raised. If *on_message* raises ``PauseTurn``, this
+        returns normally with the SDK turn left open — see ``continue_turn``.
         """
+        if self._pending_inbox is not None:
+            raise SdkSessionError(
+                "claude-sub session already has an open turn; call continue_turn()."
+            )
         self.ensure_started()
         inbox: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         future = asyncio.run_coroutine_threadsafe(
             self._pump_turn(prompt, inbox), self._require_loop()
         )
+        return self._drain(
+            inbox,
+            future,
+            on_message=on_message,
+            timeout=timeout,
+            stall_timeout=stall_timeout,
+            stall_exempt=stall_exempt,
+        )
 
+    def continue_turn(
+        self,
+        *,
+        on_message: Callable[[Any], None],
+        timeout: Optional[float] = None,
+        stall_timeout: Optional[float] = None,
+        stall_exempt: Optional[Callable[[], bool]] = None,
+    ) -> int:
+        """Resume draining a turn previously paused by ``PauseTurn``. No new ``query()``."""
+        inbox = self._pending_inbox
+        future = self._pending_future
+        if inbox is None or future is None:
+            raise SdkSessionError("claude-sub session has no open turn to continue.")
+        return self._drain(
+            inbox,
+            future,
+            on_message=on_message,
+            timeout=timeout,
+            stall_timeout=stall_timeout,
+            stall_exempt=stall_exempt,
+        )
+
+    # ---------- internals ----------
+
+    def _drain(
+        self,
+        inbox: "queue.Queue[tuple[str, Any]]",
+        future: Any,
+        *,
+        on_message: Callable[[Any], None],
+        timeout: Optional[float],
+        stall_timeout: Optional[float],
+        stall_exempt: Optional[Callable[[], bool]],
+    ) -> int:
         turn_timeout = timeout if timeout is not None else 1800.0
         deadline = time.monotonic() + turn_timeout
         last_activity = time.monotonic()
         delivered = 0
+        paused = False
         try:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self.request_interrupt()
                     raise TimeoutError(
                         f"claude-sub turn exceeded {turn_timeout:.0f}s without completing."
                     )
@@ -210,6 +305,7 @@ class SdkSession:
                         if stall_exempt is not None and stall_exempt():
                             last_activity = now
                         elif now - last_activity > stall_timeout:
+                            self.request_interrupt()
                             raise TimeoutError(
                                 f"claude-sub turn received no SDK messages for "
                                 f"{stall_timeout:.0f}s (stalled)."
@@ -218,18 +314,29 @@ class SdkSession:
                 last_activity = time.monotonic()
                 if kind == "message":
                     delivered += 1
-                    on_message(payload)
+                    try:
+                        on_message(payload)
+                    except PauseTurn:
+                        paused = True
+                        break
                     continue
                 if kind == "error":
                     raise payload
                 break
         except BaseException:
-            future.cancel()
+            if not paused:
+                future.cancel()
+                self._pending_inbox = None
+                self._pending_future = None
             raise
-        future.result(timeout=self._close_timeout)
+        if paused:
+            self._pending_inbox = inbox
+            self._pending_future = future
+        else:
+            future.result(timeout=self._close_timeout)
+            self._pending_inbox = None
+            self._pending_future = None
         return delivered
-
-    # ---------- internals ----------
 
     def _run_loop(self, loop: asyncio.AbstractEventLoop, ready: threading.Event) -> None:
         asyncio.set_event_loop(loop)
@@ -327,6 +434,7 @@ class SdkSession:
 __all__ = [
     "SdkSession",
     "SdkSessionError",
+    "PauseTurn",
     "DEFAULT_IDENTITY_APPEND",
     "build_options",
     "is_result_message",

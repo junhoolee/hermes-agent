@@ -124,6 +124,7 @@ class ClaudeAgentOptions:
     model: Any = None
     effort: Any = None
     resume: Any = None
+    hooks: Any = None
 
 
 @dataclass

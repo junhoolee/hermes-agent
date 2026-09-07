@@ -54,12 +54,15 @@ def _fake_session_factory(*, messages=None, raise_exc=None, closed_flag):
         def __init__(self, **_kwargs):
             pass
 
-        def run_turn(self, prompt, *, on_message, timeout=None, stall_timeout=None):
+        def run_turn(self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None):
             if raise_exc is not None:
                 raise raise_exc
             for message in messages or []:
                 on_message(message)
             return len(messages or [])
+
+        def request_interrupt(self):
+            return True
 
         def close(self):
             closed_flag["closed"] = True
@@ -157,7 +160,14 @@ class TestOneShotSuccess:
         )
         assert completion.choices[0].message.content == "partial"
 
-    def test_stream_true_returns_two_chunks(self, monkeypatch, client_module, closed_flag):
+    def test_stream_true_yields_content_stop_and_usage_chunks(
+        self, monkeypatch, client_module, closed_flag
+    ):
+        """v0.1-B streams real incremental chunks (see test_stream.py for the
+        StreamEvent-delta path); this fake has no StreamEvent messages, so the
+        content arrives as a single AssistantMessage-derived chunk, followed by
+        the separate stop and usage chunks D17 requires (no longer the v0.1-A
+        2-chunk fold — that collapsed shape doesn't survive real streaming)."""
         _install_fake_session(
             monkeypatch,
             client_module,
@@ -168,14 +178,18 @@ class TestOneShotSuccess:
             ],
         )
         client = _make_client(client_module)
-        chunks = client.chat.completions.create(
-            model="claude-sonnet-5",
-            messages=[{"role": "user", "content": "hi"}],
-            stream=True,
+        chunks = list(
+            client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
         )
-        assert len(chunks) == 2
+        assert len(chunks) == 3
         assert chunks[0].choices[0].delta.content == "Hello!"
-        assert chunks[1].usage is not None
+        assert chunks[1].choices[0].finish_reason == "stop"
+        assert chunks[2].usage is not None
+        assert closed_flag["closed"] is True
 
 
 class TestOneShotErrors:
