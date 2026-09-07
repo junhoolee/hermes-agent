@@ -876,6 +876,10 @@ def _make_on_post_tool_use(turn: _Turn):
             handled = tool_use_id in turn.handled_ids
             if not handled:
                 turn.cli_resolved.add(tool_use_id)
+            # PostToolUse settles this id; a stale hook_seen entry for it must
+            # not win a later on_call() match (that would bind a live call to
+            # a dead id and block forever — see v0.1-D review, run 176).
+            turn.hook_seen[:] = [entry for entry in turn.hook_seen if entry[0] != tool_use_id]
         logger.info(
             "claude-sub: PostToolUse id=%s name=%s handled=%s failed=%s response=%s",
             tool_use_id,

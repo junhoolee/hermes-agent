@@ -320,6 +320,47 @@ class TestCliResolvedBlocksAreNotSent:
         on_post_tool_use("toolu_2", "read_file", {"content": []}, False)
         assert turn.cli_resolved == {"toolu_1"}
 
+    def test_post_tool_use_clears_hook_seen_so_a_later_same_args_call_binds_fresh(
+        self, client_module
+    ):
+        """v0.1-D review (run 176): once PostToolUse settles an id, its
+        ``hook_seen`` entry must not survive to win a later ``on_call()``
+        match against the *same* ``(name, args)`` — otherwise a live block's
+        Future gets bound to the dead id while the live id's stashed
+        continuation result is never consumed, and the handler hangs
+        forever.
+        """
+        turn = client_module._Turn(session=None, start_timeout=5.0)
+        on_pre_tool_use = client_module._make_on_pre_tool_use(turn)
+        on_post_tool_use = client_module._make_on_post_tool_use(turn)
+        on_call = client_module._make_on_call(turn)
+        args = {"path": "/x"}
+
+        # id1: CLI resolves it itself, no handler ever runs for it.
+        on_pre_tool_use("id1", "read_file", args)
+        on_post_tool_use("id1", "read_file", {"content": []}, False)
+        assert turn.cli_resolved == {"id1"}
+        assert turn.hook_seen == []
+
+        # The model reissues the identical call; the CLI mints a new block id.
+        block = ToolUseBlock(id="id2", name="mcp__hermes__read_file", input=args)
+        sendable = client_module._note_tool_blocks(turn, [block])
+        assert sendable == [block]
+        assert turn.outstanding == {"id2": ("read_file", client_module.args_key(args))}
+        on_pre_tool_use("id2", "read_file", args)
+
+        # The continuation result for id2 arrives before the handler runs.
+        payload = {"content": [{"type": "text", "text": "ok"}], "is_error": False}
+        with turn.lock:
+            turn.results["id2"] = payload
+
+        fut = on_call("read_file", args)
+
+        assert fut.done()
+        assert fut.result() == payload
+        assert turn.pending == {}
+        assert turn.results == {}
+
 
 class TestAbortCancelsPendingAndUnbound:
     def test_abort_turn_cancels_and_clears_everything(self, client_module):
