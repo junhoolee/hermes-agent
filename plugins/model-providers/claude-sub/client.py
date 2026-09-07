@@ -949,24 +949,38 @@ class ClaudeSubClient:
         session_key = self._resolve_session_key(messages, extra_body)
         has_session_id = isinstance(extra_body, dict) and bool(extra_body.get("hermes_session_id"))
 
+        # The idle-timer callback (``_arm_idle_timer``'s ``_on_idle_expired``)
+        # pops the turn from ``self._turns`` and closes its session under
+        # ``_turns_lock`` the instant it sees ``state == "idle"``. The lookup,
+        # the warm-followup decision, and the "claim it" transition
+        # (state -> "open") must all happen inside that same lock, or the
+        # timer can fire in the gap between deciding "warm" and recording the
+        # claim, close the session out from under this call, and leave it
+        # calling ``run_turn``/``continue_turn`` on an already-closed session
+        # (D35 review, run 180). ``_is_warm_followup`` is pure (no I/O), so
+        # holding the lock across it is safe. Re-fetching by key inside the
+        # lock also means a timer that already won the race (already popped
+        # the turn) is simply seen as a miss here and falls through to the
+        # cold-start path below.
         with self._turns_lock:
             turn = self._turns.get(session_key)
+            is_warm_followup = False
+            if turn is not None and turn.state == "idle":
+                if _is_warm_followup(
+                    messages,
+                    turn,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    tools=tools,
+                    extra_body=extra_body,
+                ):
+                    is_warm_followup = True
+                    turn.state = "open"
 
         tail = None
-        if turn is not None and turn.state == "paused":
+        if not is_warm_followup and turn is not None and turn.state == "paused":
             tail = _classify_continuation(messages, turn)
         is_continuation = tail is not None
-
-        is_warm_followup = False
-        if not is_continuation and turn is not None and turn.state == "idle":
-            is_warm_followup = _is_warm_followup(
-                messages,
-                turn,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                tools=tools,
-                extra_body=extra_body,
-            )
 
         prompt: str | None = None
         if is_continuation:
@@ -977,7 +991,6 @@ class ClaudeSubClient:
             turn.state = "open"
         elif is_warm_followup:
             self._cancel_idle_timer(turn)
-            turn.state = "open"
             tail_messages = messages[turn.seen_count :]
             prompt = "\n\n".join(
                 convert.text_from_content(message.get("content")) for message in tail_messages

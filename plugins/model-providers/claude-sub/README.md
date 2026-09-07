@@ -104,10 +104,17 @@ for the sibling pattern) and supplies its own client via
     warm retention — it operates purely on the in-flight `_Turn`, whether
     that turn was opened cold or via a warm follow-up.
   - Idle-timer bookkeeping: a follow-up arriving before the TTL expires
-    cancels the timer and resumes the same session; the CLI does not restart
-    twice in a race between an about-to-fire timer and an incoming warm
-    follow-up (`_arm_idle_timer`'s callback re-checks the same `_Turn`
-    identity and `state == "idle"` under `_turns_lock` before closing).
+    cancels the timer and resumes the same session. The lookup, the warm
+    decision, and claiming the turn (`state` -> `"open"`) all happen inside
+    one `_turns_lock` critical section in `_create_chat_completion`, and
+    `_arm_idle_timer`'s callback re-checks the same `_Turn` identity and
+    `state == "idle"` under that same lock before popping it and closing —
+    so the two sides can never interleave: whichever gets the lock first
+    wins outright, either claiming the turn (the timer then sees
+    `state != "idle"` and no-ops) or closing it (the create() call then finds
+    the turn already gone and falls back to a cold restart). The CLI never
+    ends up serving a `run_turn()`/`continue_turn()` call against a session
+    the timer already closed.
   - `ClaudeSubClient.close()` cancels every idle timer and closes every idle
     session, same as any other open turn.
 

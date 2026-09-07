@@ -27,6 +27,7 @@ cross-file import isn't available — see AGENTS.md D13).
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 from dataclasses import dataclass
 
@@ -652,3 +653,101 @@ class TestStreamingWarmSession:
         assert second_chunks[0].choices[0].delta.content == second_reply
         assert len(instantiations) == 1
         assert calls_log[-1] == ("run_turn", "keep going")
+
+
+class TestIdleExpiryRaceAgainstWarmClaim:
+    def test_idle_timer_firing_during_warm_decision_does_not_close_reused_session(
+        self, monkeypatch, client_module, session_module, instantiations
+    ):
+        """D35 review (run 180): before this fix, ``create()`` fetched the
+        turn under ``_turns_lock``, released it, then decided "warm" and set
+        ``turn.state = "open"`` several lines later — all outside the lock.
+        The idle-timer callback (also gated on ``state == "idle"``, but under
+        the lock) could fire in that gap, pop the turn, and close its
+        session before ``create()`` got to claim it, so the warm follow-up
+        would go on to call ``run_turn``/``continue_turn`` on an already-closed
+        session.
+
+        This test forces exactly that interleaving: from inside
+        ``_is_warm_followup`` (which the fix now calls *while holding*
+        ``_turns_lock``), it spawns a thread that invokes the idle timer's
+        callback directly (bypassing the real TTL wait, and bypassing
+        ``Timer.cancel()``'s usual protection too — this reproduces the
+        documented edge case where a timer's background thread has already
+        passed its own cancellation check). That thread can only actually
+        resolve its lock-guarded check once the decision block releases
+        ``_turns_lock``, so this proves the fix serializes the two sides
+        instead of merely hoping they don't interleave.
+
+        The fake session's run_turn/continue_turn are pure in-memory
+        replays with no real I/O, so after the lock is released the rest of
+        create() (run the warm turn, stop, re-idle) can finish before the OS
+        ever schedules the blocked racer thread back in — which would let
+        the racer's stale fire land during a *later*, unrelated idle period
+        instead of the window under test. ``_cancel_idle_timer`` is the
+        first thing create() does after releasing the lock, before it ever
+        calls run_turn, so pinning it as a rendezvous (wait for the racer to
+        resolve before letting the call proceed) keeps the race deterministic
+        without changing what's being exercised.
+        """
+        second_reply = "still here after the race"
+        script = [
+            [
+                [
+                    AssistantMessage(content=[TextBlock(text=FIRST_REPLY_TEXT)]),
+                    ResultMessage(is_error=False, result=FIRST_REPLY_TEXT),
+                ],
+                [
+                    AssistantMessage(content=[TextBlock(text=second_reply)]),
+                    ResultMessage(is_error=False, result=second_reply),
+                ],
+            ]
+        ]
+        _install_fake_session(monkeypatch, client_module, session_module, instantiations, session_scripts=script)
+        client = _make_client(client_module, idle_session_ttl=1800.0)
+
+        _first_call(client)
+        turn = client._turns["warm-1"]
+        assert turn.idle_timer is not None
+        stale_idle_timer = turn.idle_timer
+
+        fired = threading.Event()
+        original_is_warm_followup = client_module._is_warm_followup
+
+        def _patched_is_warm_followup(*args, **kwargs):
+            def _fire_idle_expiry() -> None:
+                stale_idle_timer.function()  # simulate the real Timer firing now
+                fired.set()
+
+            racer = threading.Thread(target=_fire_idle_expiry, daemon=True)
+            racer.start()
+            # Give the racer a chance to reach (and block on) _turns_lock,
+            # which this call is currently holding.
+            time.sleep(0.05)
+            return original_is_warm_followup(*args, **kwargs)
+
+        monkeypatch.setattr(client_module, "_is_warm_followup", _patched_is_warm_followup)
+
+        original_cancel_idle_timer = client._cancel_idle_timer
+
+        def _patched_cancel_idle_timer(t):
+            assert fired.wait(timeout=2.0)
+            return original_cancel_idle_timer(t)
+
+        monkeypatch.setattr(client, "_cancel_idle_timer", _patched_cancel_idle_timer)
+
+        second = client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[
+                SYSTEM,
+                FIRST_USER,
+                {"role": "assistant", "content": FIRST_REPLY_TEXT},
+                {"role": "user", "content": "still there?"},
+            ],
+            extra_body={"hermes_session_id": "warm-1"},
+        )
+
+        assert second.choices[0].finish_reason == "stop"
+        assert second.choices[0].message.content == second_reply
+        assert len(instantiations) == 1  # no cold-restart session was opened
+        assert instantiations[0].closed is False  # the racer's close() was a no-op
