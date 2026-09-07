@@ -2,8 +2,10 @@
 
 The claude-agent-sdk session speaks one text prompt per turn, not an OpenAI
 ``messages`` list. This module renders the Hermes conversation into that
-prompt (v0.1: text only, tool-call-free — see the plugin README) and turns
-the SDK's per-call usage dict into OpenAI-shaped token counts.
+prompt — including a coldstart's prior ``tool_calls``/``tool`` history, so
+a model resuming mid-conversation can see what was already tried, with what
+arguments, and what came back, instead of repeating the same call blind —
+and turns the SDK's per-call usage dict into OpenAI-shaped token counts.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ from __future__ import annotations
 from typing import Any
 
 BOOTSTRAP_MAX_MESSAGES = 200
+BOOTSTRAP_TOOL_ARGS_MAX_CHARS = 500
+BOOTSTRAP_TOOL_RESULT_MAX_CHARS = 2000
 
 
 def _text_from_content(content: Any) -> str:
@@ -47,7 +51,9 @@ def split_messages(messages: list[dict]) -> tuple[str, str, list[dict]]:
     """Split *messages* into (system_text, last_user_text, prior_messages).
 
     ``prior_messages`` excludes the system message and the final user
-    message — those are rendered separately by the caller.
+    message — those are rendered separately by the caller. ``tool`` messages
+    and assistant ``tool_calls`` ARE included (in original order) so the
+    bootstrap prompt can replay what was already tried.
     """
     system_text = ""
     last_user_index: int | None = None
@@ -69,13 +75,13 @@ def split_messages(messages: list[dict]) -> tuple[str, str, list[dict]]:
             for i, m in enumerate(messages)
             if i != last_user_index
             and isinstance(m, dict)
-            and m.get("role") in ("user", "assistant")
+            and m.get("role") in ("user", "assistant", "tool")
         ]
     else:
         prior_messages = [
             m
             for m in messages
-            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant", "tool")
         ]
 
     return system_text, last_user_text, prior_messages
@@ -98,25 +104,67 @@ def context_prefix(system_text: str) -> str:
     )
 
 
-def _render_bootstrap_message(message: dict) -> str | None:
-    role = message.get("role")
-    if role not in ("user", "assistant"):
-        return None
-    text = _text_from_content(message.get("content")).strip()
-    if not text:
-        return None
-    return f"{'User' if role == 'user' else 'Assistant'}: {text}"
+def _truncate(text: str, max_chars: int, *, suffix: str = "") -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + suffix
+
+
+def _tool_call_id_name_args(call: Any) -> tuple[str | None, str | None, str]:
+    if not isinstance(call, dict):
+        return None, None, ""
+    call_id = call.get("id")
+    function = call.get("function")
+    name = function.get("name") if isinstance(function, dict) else None
+    arguments = function.get("arguments") if isinstance(function, dict) else None
+    return call_id, name, "" if arguments is None else str(arguments)
+
+
+def _render_bootstrap_messages(messages: list[dict]) -> list[str]:
+    """Render *messages* into ``<prior_conversation>`` lines.
+
+    Tool calls and their results are replayed (not dropped): a coldstart
+    turn otherwise has no way to know what a prior turn already tried, with
+    what arguments, and what came back, and ends up repeating the same call
+    blind. ``tool_call_id -> name`` is tracked as assistant ``tool_calls``
+    are seen so a later ``tool`` message can be labelled by name.
+    """
+    lines: list[str] = []
+    tool_names: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            text = _text_from_content(message.get("content")).strip()
+            if text:
+                lines.append(f"User: {text}")
+        elif role == "assistant":
+            text = _text_from_content(message.get("content")).strip()
+            if text:
+                lines.append(f"Assistant: {text}")
+            for call in message.get("tool_calls") or []:
+                call_id, name, arguments = _tool_call_id_name_args(call)
+                if call_id and name:
+                    tool_names[call_id] = name
+                args_text = _truncate(arguments, BOOTSTRAP_TOOL_ARGS_MAX_CHARS)
+                lines.append(f"[tool call id={call_id} name={name} args={args_text}]")
+        elif role == "tool":
+            text = _text_from_content(message.get("content")).strip()
+            if not text:
+                continue
+            call_id = message.get("tool_call_id")
+            label = (tool_names.get(call_id) if isinstance(call_id, str) else None) or call_id
+            result_text = _truncate(
+                text, BOOTSTRAP_TOOL_RESULT_MAX_CHARS, suffix=" …[truncated]"
+            )
+            lines.append(f"Tool result ({label}): {result_text}")
+    return lines
 
 
 def bootstrap_prefix(prior_messages: list[dict], *, bootstrap_max_chars: int) -> str:
     """Wrap prior conversation history as a ``<prior_conversation>`` block."""
-    rendered = [
-        line
-        for line in (
-            _render_bootstrap_message(m) for m in prior_messages[-BOOTSTRAP_MAX_MESSAGES:]
-        )
-        if line
-    ]
+    rendered = _render_bootstrap_messages(prior_messages[-BOOTSTRAP_MAX_MESSAGES:])
     if not rendered:
         return ""
     body = "\n\n".join(rendered)
@@ -125,7 +173,10 @@ def bootstrap_prefix(prior_messages: list[dict], *, bootstrap_max_chars: int) ->
     return (
         "<prior_conversation>\n"
         "This conversation started with a different model. The exchange so far "
-        "is reproduced below for context; it is history, not a new request.\n\n"
+        "is reproduced below for context; it is history, not a new request. "
+        "Tool calls and their results from earlier turns are included as "
+        "`[tool call ...]` / `Tool result (...)` lines; treat them as already "
+        "executed — do not repeat them unless the user asks.\n\n"
         f"{body}\n"
         "</prior_conversation>\n\n"
     )

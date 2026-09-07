@@ -6,10 +6,27 @@ Pro/Max/Team subscription without an ACP subprocess. Registers itself as an
 for the sibling pattern) and supplies its own client via
 `ProviderProfile.create_client()` — no core edits required.
 
-## Status: v0.1-E
+## Status: v0.1-F
 
 - v0.1-A (profile registration, settings, scrubbed child environment, error
   mapping, message→prompt conversion, synchronous one-shot session runner) plus:
+- **Bootstrap tool history** (v0.1-F, `convert.py`): a coldstart's
+  `<prior_conversation>` replay used to drop every `role: "tool"` message and
+  assistant `tool_calls` entirely, so a model resuming mid-conversation (a
+  new/mismatched turn, `idle_session_ttl` expiry, `idle_session_ttl: 0`, or a
+  provider fallback) had no way to see what a prior turn already tried, with
+  what arguments, or what came back — the reported symptom was the model
+  blindly repeating the same tool call. `split_messages()` now keeps `tool`
+  messages (and assistant `tool_calls`) in `prior_messages`, in original
+  order, and `bootstrap_prefix()` renders each assistant tool call as its own
+  `[tool call id=<id> name=<name> args=<arguments, truncated to
+  `BOOTSTRAP_TOOL_ARGS_MAX_CHARS`=500 chars>]` line, and each `tool` result as
+  `Tool result (<name>): <text, truncated to
+  `BOOTSTRAP_TOOL_RESULT_MAX_CHARS`=2000 chars, marked "…[truncated]">` — the
+  name is resolved by looking up `tool_call_id` against the assistant
+  `tool_calls` seen earlier in the same replay, falling back to the raw id if
+  unresolved. The `<prior_conversation>` preamble now tells the model these
+  lines are already-executed history, not a request to repeat them.
 - **Tool-call inversion** (`bridge.py`): Hermes' OpenAI `tools` are wrapped as
   an in-process `claude_agent_sdk` MCP server (`mcp__hermes__<name>`). A
   `PreToolUse` hook denies every non-bridge tool call (except `ToolSearch`,
@@ -173,7 +190,11 @@ providers:
   history/model/tools stay exactly as that session last saw them; anything
   else (a genuinely new conversation, a history mismatch, `idle_session_ttl`
   expiry, or `idle_session_ttl: 0`) falls back to a fresh SDK session that
-  replays the bootstrapped conversation as its prompt.
+  replays the bootstrapped conversation as its prompt — as of v0.1-F that
+  replay includes prior `tool_calls`/`tool` history (see above), so this
+  fallback path no longer hides earlier tool activity from the model; it is
+  still a text replay, not a live tool round-trip, so per-message truncation
+  (500/2000 chars) and the 200-message/`bootstrap_max_chars` caps still apply.
 - Interrupting a turn that's mid bridge-tool-call has the same latency as any
   other interrupt — the SDK doesn't cancel an in-flight tool result wait any
   faster than a normal generation.
