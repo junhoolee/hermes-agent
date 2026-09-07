@@ -29,7 +29,6 @@ import os
 import queue
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -45,6 +44,17 @@ MARKER_BASE_URL = "claude-sub://sdk"
 
 _STREAM_DONE = object()
 
+# Upper bound for reconciling a bridge handler call against its matching
+# tool-use block when they arrive out of order (see ``_wait_for_pending``).
+# Deliberately independent of ``settings.start_timeout`` (SDK session
+# connect timeout) — this is a same-process handoff, not a subprocess
+# startup, so it should resolve in milliseconds, not tens of seconds.
+BRIDGE_BIND_TIMEOUT = 10.0
+
+
+class BridgeBindTimeout(RuntimeError):
+    """A bridge handler call and its tool-use block never reconciled in time."""
+
 
 @dataclass
 class _Turn:
@@ -54,6 +64,7 @@ class _Turn:
     start_timeout: float
     pending: dict = field(default_factory=dict)  # call_id -> concurrent.futures.Future
     expected_ids: list = field(default_factory=list)  # ordered [(call_id, name), ...]
+    unbound: list = field(default_factory=list)  # ordered [(name, Future), ...]
     lock: threading.RLock = field(default_factory=threading.RLock)
     opened_at: float = field(default_factory=time.monotonic)
     orphan_timer: Any = None
@@ -65,21 +76,45 @@ def _derive_session_key(system_text: str, first_user_text: str) -> str:
 
 
 def _register_expected(turn: _Turn, tool_blocks: list) -> None:
+    """Match each tool-use *block* against a bridge handler call, either way round.
+
+    Handler and projector run on different threads and there is no
+    guarantee which one reaches its half of the pair first (the SDK spawns
+    the MCP tool call as soon as it appears on the control channel, often
+    before the drain thread has projected the matching ``AssistantMessage``
+    block — see the module docstring). If ``on_call`` already parked a
+    Future for this block's short name in ``turn.unbound``, claim it
+    directly into ``pending``; otherwise queue the expectation for
+    ``on_call`` to find when it runs.
+    """
     with turn.lock:
         for block in tool_blocks:
             name = getattr(block, "name", "") or ""
             short_name = name[len(BRIDGE_PREFIX):] if name.startswith(BRIDGE_PREFIX) else name
-            turn.expected_ids.append((getattr(block, "id", None), short_name))
+            call_id = getattr(block, "id", None)
+            fut = None
+            for index, (unbound_name, unbound_fut) in enumerate(turn.unbound):
+                if unbound_name == short_name:
+                    fut = unbound_fut
+                    del turn.unbound[index]
+                    break
+            if fut is not None:
+                turn.pending[call_id] = fut
+            else:
+                turn.expected_ids.append((call_id, short_name))
 
 
 def _wait_for_pending(turn: _Turn, ids: list) -> None:
     """Block (briefly) until *ids* all have a Future registered in pending.
 
-    The bridge handler (running on the SDK's own event-loop thread) is what
-    registers them, concurrently with this call. Bounded by the turn's
-    start_timeout so a wedged handler can't hang the pump forever.
+    ``on_call`` and ``_register_expected`` reconcile handler-first and
+    projector-first arrival against each other under ``turn.lock`` (see
+    their docstrings), so by the time either side reaches this call, *ids*
+    should already be bound — this is a short poll for the remaining
+    in-flight window between the two. Bounded by ``BRIDGE_BIND_TIMEOUT`` so
+    a genuinely wedged handler can't hang the pump forever.
     """
-    deadline = time.monotonic() + turn.start_timeout
+    deadline = time.monotonic() + BRIDGE_BIND_TIMEOUT
     while True:
         with turn.lock:
             if all(i in turn.pending for i in ids):
@@ -88,12 +123,15 @@ def _wait_for_pending(turn: _Turn, ids: list) -> None:
             logger.warning(
                 "claude-sub: timed out waiting for bridge handler registration for %s", ids
             )
-            return
+            raise BridgeBindTimeout(
+                f"claude-sub: bridge handler registration timed out for {ids}"
+            )
         time.sleep(0.01)
 
 
 def _make_on_call(turn: _Turn):
     def on_call(name: str, _args: dict) -> "concurrent.futures.Future":
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
         with turn.lock:
             call_id = None
             for index, (cid, expected_name) in enumerate(turn.expected_ids):
@@ -101,16 +139,14 @@ def _make_on_call(turn: _Turn):
                     call_id = cid
                     del turn.expected_ids[index]
                     break
-            if call_id is None:
-                call_id = f"claudesub_{uuid.uuid4().hex[:12]}"
-                logger.warning(
-                    "claude-sub: bridge call for %r had no matching expected id; "
-                    "generated %s",
+            if call_id is not None:
+                turn.pending[call_id] = fut
+            else:
+                turn.unbound.append((name, fut))
+                logger.debug(
+                    "claude-sub: bridge handler for %s arrived before its tool_use block; parking",
                     name,
-                    call_id,
                 )
-            fut: "concurrent.futures.Future" = concurrent.futures.Future()
-            turn.pending[call_id] = fut
         return fut
 
     return on_call
@@ -399,9 +435,13 @@ class ClaudeSubClient:
         turn.session.request_interrupt()
         with turn.lock:
             pending = list(turn.pending.values())
+            unbound = [fut for _name, fut in turn.unbound]
             turn.pending.clear()
             turn.expected_ids.clear()
+            turn.unbound.clear()
         for fut in pending:
+            fut.cancel()
+        for fut in unbound:
             fut.cancel()
         turn.session.close()
 

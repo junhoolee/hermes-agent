@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 BRIDGE_SERVER_NAME = "hermes"
 BRIDGE_PREFIX = f"mcp__{BRIDGE_SERVER_NAME}__"
 
+# The claude CLI defers loading MCP tool schemas behind this built-in
+# metatool (it lists names only until ``ToolSearch`` is called to fetch a
+# tool's full schema). Denying it like every other non-bridge tool leaves
+# the model unable to ever see ``mcp__hermes__*`` schemas at all. It is
+# safe to allow unconditionally: it only loads schemas and never executes
+# anything itself, so it can't bypass the "Hermes owns tool execution"
+# contract this hook enforces for everything else.
+PASSTHROUGH_TOOLS = frozenset({"ToolSearch"})
+
 # Tools safe to mark read-only for the CLI's own permission UI (irrelevant
 # here since PreToolUse allows/denies unconditionally, but the SDK exposes
 # the hint to the model regardless).
@@ -101,7 +110,7 @@ def build_bridge(
 
 async def _deny_non_bridge_tool(hook_input: Any, _tool_use_id: Any, _context: Any) -> dict:
     name = str((hook_input or {}).get("tool_name") or "")
-    if name.startswith(BRIDGE_PREFIX):
+    if name.startswith(BRIDGE_PREFIX) or name in PASSTHROUGH_TOOLS:
         return {}
     return {
         "hookSpecificOutput": {
@@ -125,6 +134,7 @@ def build_pretooluse_hooks() -> dict[str, Any]:
 __all__ = [
     "BRIDGE_SERVER_NAME",
     "BRIDGE_PREFIX",
+    "PASSTHROUGH_TOOLS",
     "READ_ONLY",
     "build_bridge",
     "build_pretooluse_hooks",

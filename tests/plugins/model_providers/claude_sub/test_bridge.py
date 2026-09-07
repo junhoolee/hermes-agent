@@ -117,3 +117,13 @@ class TestPreToolUseDenyHook:
         assert decision["permissionDecision"] == "deny"
         assert "Bash" in decision["permissionDecisionReason"]
         assert "mcp__hermes__" in decision["permissionDecisionReason"]
+
+    def test_read_is_denied(self, bridge_module, fake_sdk):
+        hook = self._hook_fn(bridge_module, fake_sdk)
+        result = asyncio.run(hook({"tool_name": "Read"}, "tu_1", {}))
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_toolsearch_is_passed_through(self, bridge_module, fake_sdk):
+        hook = self._hook_fn(bridge_module, fake_sdk)
+        result = asyncio.run(hook({"tool_name": "ToolSearch"}, "tu_1", {}))
+        assert result == {}
