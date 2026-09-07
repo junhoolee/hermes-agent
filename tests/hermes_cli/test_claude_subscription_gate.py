@@ -10,8 +10,10 @@ from hermes_cli import claude_subscription
 from hermes_cli.claude_subscription import (
     CLAUDE_AGENT_SDK_MIN_VERSION,
     CLAUDE_CLI_MIN_VERSION,
+    DEFAULT_IDLE_SESSION_TTL_SECONDS,
     claude_agent_sdk_available,
     claude_subscription_enabled,
+    claude_subscription_idle_session_ttl,
     claude_subscription_start_timeout,
 )
 from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -95,6 +97,46 @@ def test_start_timeout_rejects_malformed_values_without_raising():
         ) is None
     for config in ("not-a-dict", [], 0, {"claude_subscription": "yes"}):
         assert claude_subscription_start_timeout(config) is None
+
+
+def test_idle_session_ttl_reads_the_configured_seconds():
+    assert claude_subscription_idle_session_ttl(
+        {"claude_subscription": {"idle_session_ttl_secs": 900}}
+    ) == 900.0
+    assert claude_subscription_idle_session_ttl(
+        {"claude_subscription": {"idle_session_ttl_secs": "60"}}
+    ) == 60.0
+
+
+def test_idle_session_ttl_defaults_when_unset():
+    assert claude_subscription_idle_session_ttl(None) == DEFAULT_IDLE_SESSION_TTL_SECONDS
+    assert claude_subscription_idle_session_ttl({}) == DEFAULT_IDLE_SESSION_TTL_SECONDS
+    assert (
+        claude_subscription_idle_session_ttl({"claude_subscription": {}})
+        == DEFAULT_IDLE_SESSION_TTL_SECONDS
+    )
+    assert (
+        claude_subscription_idle_session_ttl(DEFAULT_CONFIG)
+        == DEFAULT_IDLE_SESSION_TTL_SECONDS
+    )
+
+
+def test_idle_session_ttl_zero_or_negative_disables_reclaim():
+    """0 or negative is an explicit opt-out (reclaim disabled), distinct
+    from an unset/malformed value which falls back to the default."""
+    for value in (0, -5, -0.5):
+        assert claude_subscription_idle_session_ttl(
+            {"claude_subscription": {"idle_session_ttl_secs": value}}
+        ) == 0.0
+
+
+def test_idle_session_ttl_rejects_malformed_values_without_raising():
+    for value in ("soon", None, [], {}, False, True):
+        assert claude_subscription_idle_session_ttl(
+            {"claude_subscription": {"idle_session_ttl_secs": value}}
+        ) == DEFAULT_IDLE_SESSION_TTL_SECONDS
+    for config in ("not-a-dict", [], 0, {"claude_subscription": "yes"}):
+        assert claude_subscription_idle_session_ttl(config) == DEFAULT_IDLE_SESSION_TTL_SECONDS
 
 
 def test_pinned_versions_are_orderable_version_strings():

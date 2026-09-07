@@ -464,6 +464,32 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _detach_claude_agent_sdk_session_impl(agent: Any):
+    """Shared body for ``AIAgent._detach_claude_agent_sdk_session``.
+
+    A free function rather than a same-class helper called via
+    ``self._detach_claude_agent_sdk_session()`` or ``AIAgent._detach_...(self)``
+    on purpose: both of those resolve through a name (an attribute on
+    ``self``, or the module-global ``AIAgent``) that tests in this codebase
+    routinely rebind — duck-typed stand-ins for ``self`` and
+    ``patch("run_agent.AIAgent", ...)`` context managers are both common
+    here (see tests/tools/test_delegate_claude_sdk.py, which does both at
+    once). A plain module-level function name is never one of those seams,
+    so ``agent`` can be a real AIAgent OR a duck-typed stand-in either way.
+    """
+    session = getattr(agent, "_claude_session", None)
+    if session is None:
+        return None
+    # Mirror agent.claude_runtime._retire_session: the next session must
+    # re-prove its billing source, whichever teardown path retired this
+    # one. claude_runtime is already imported whenever a session existed.
+    from agent.claude_runtime import _UNSET as _billing_unset
+
+    agent._claude_billing_refusal = _billing_unset
+    agent._claude_session = None
+    return session
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -5046,22 +5072,27 @@ class AIAgent:
         # resumes is rebuilt and would spawn its own session anyway.
         self._release_claude_agent_sdk_session()
 
+    def _detach_claude_agent_sdk_session(self):
+        """Detach the Claude Agent SDK session without closing it.
+
+        Returns the detached session object (or ``None`` if no session was
+        ever started).  Splitting detach from close lets a caller pop the
+        session out from under a still-cached agent (e.g. an idle-TTL
+        reclaim) while running the actual ``session.close()`` — which can
+        block for a few seconds tearing down the claude CLI subprocess —
+        off the calling thread. No I/O, never raises.
+        """
+        return _detach_claude_agent_sdk_session_impl(self)
+
     def _release_claude_agent_sdk_session(self) -> None:
         """Tear down the Claude Agent SDK session, if one was ever started.
 
         Idempotent and never raises — called from both the soft eviction path
         and the hard teardown.
         """
-        session = getattr(self, "_claude_session", None)
+        session = _detach_claude_agent_sdk_session_impl(self)
         if session is None:
             return
-        # Mirror agent.claude_runtime._retire_session: the next session must
-        # re-prove its billing source, whichever teardown path retired this
-        # one. claude_runtime is already imported whenever a session existed.
-        from agent.claude_runtime import _UNSET as _billing_unset
-
-        self._claude_billing_refusal = _billing_unset
-        self._claude_session = None
         try:
             session.close()
         except Exception:

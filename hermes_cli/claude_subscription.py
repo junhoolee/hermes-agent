@@ -68,6 +68,40 @@ def claude_subscription_start_timeout(config: Optional[dict] = None) -> Optional
     return value if value > 0 else None
 
 
+# Default idle window before the gateway reclaims a cached agent's
+# claude_agent_sdk session (claude CLI child process + event-loop thread)
+# independently of the agent's own cache-eviction TTL.
+DEFAULT_IDLE_SESSION_TTL_SECONDS = 1800.0
+
+
+def claude_subscription_idle_session_ttl(config: Optional[dict] = None) -> float:
+    """The configured `claude_subscription.idle_session_ttl_secs` seconds.
+
+    Governs how long a cached agent's claude_agent_sdk session may sit idle
+    before the gateway's idle sweep detaches and closes it, independent of
+    the surrounding AIAgent's own agent-cache TTL — a warm claude CLI child
+    process otherwise survives as long as the cached agent does, which for a
+    `session_reset: none`/long-lived conversation is effectively forever.
+    Tolerates a missing, empty, or malformed value the same way the other
+    accessors here do, falling back to ``DEFAULT_IDLE_SESSION_TTL_SECONDS``.
+    Returns 0.0 (reclaim disabled) when the configured value is zero or
+    negative — an explicit opt-out, not a misconfiguration.
+    """
+    if not isinstance(config, dict):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    section: Any = config.get(_CONFIG_SECTION)
+    if not isinstance(section, dict):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    raw = section.get("idle_session_ttl_secs")
+    if isinstance(raw, bool) or raw is None:
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    return value if value > 0 else 0.0
+
+
 @functools.lru_cache(maxsize=1)
 def claude_agent_sdk_available() -> bool:
     """True when `claude_agent_sdk` is importable in this interpreter.
