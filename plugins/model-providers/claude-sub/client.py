@@ -531,9 +531,10 @@ class _ChatNamespace:
 class ClaudeSubClient:
     """Minimal OpenAI-client-compatible facade for the claude-sub provider."""
 
-    # This shim drives an SDK subprocess directly, so it is already a
-    # complete client (never re-dispatch it through a wire adapter) and is
-    # safe to use from async code as-is.
+    # HERMES_SKIP_TRANSPORT_WRAP/HERMES_SKIP_ASYNC_WRAP tell core not to
+    # re-wrap this client in a wire adapter/AsyncOpenAI. create() is
+    # synchronous; for async callers (auxiliary async_call_llm, etc.) core's
+    # own _to_async_client wraps it in a worker-thread offload facade.
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
@@ -832,7 +833,7 @@ class ClaudeSubClient:
         turn: _Turn,
         *,
         is_continuation: bool,
-        prompt: str | None,
+        prompt: str | convert.StreamPrompt | None,
         model: str,
         settings: Any,
         expect_tools: bool,
@@ -982,7 +983,7 @@ class ClaudeSubClient:
             tail = _classify_continuation(messages, turn)
         is_continuation = tail is not None
 
-        prompt: str | None = None
+        prompt: str | convert.StreamPrompt | None = None
         if is_continuation:
             self._resolve_pending(turn, tail)
             if turn.orphan_timer is not None:
@@ -992,9 +993,7 @@ class ClaudeSubClient:
         elif is_warm_followup:
             self._cancel_idle_timer(turn)
             tail_messages = messages[turn.seen_count :]
-            prompt = "\n\n".join(
-                convert.text_from_content(message.get("content")) for message in tail_messages
-            )
+            prompt = convert.build_followup_prompt(tail_messages)
         else:
             if turn is not None:
                 self._discard_turn(session_key, turn)
@@ -1010,13 +1009,15 @@ class ClaudeSubClient:
             )
 
         logger.info(
-            "claude-sub: create() session_key=%s continuation=%s warm=%s state=%s tools=%s stream=%s",
+            "claude-sub: create() session_key=%s continuation=%s warm=%s state=%s tools=%s "
+            "stream=%s images=%d",
             session_key,
             is_continuation,
             is_warm_followup,
             turn.state,
             bool(tools),
             stream,
+            prompt.image_count if isinstance(prompt, convert.StreamPrompt) else 0,
         )
 
         if stream:

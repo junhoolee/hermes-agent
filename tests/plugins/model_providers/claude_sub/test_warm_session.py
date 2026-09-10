@@ -576,6 +576,61 @@ class TestWarmFollowupToolFlow:
         assert client._turns["warm-1"].state == "idle"
 
 
+class TestWarmFollowupWithImage:
+    """v0.1-G: a warm follow-up whose new message carries an image still reuses the session."""
+
+    def test_image_in_new_message_produces_stream_prompt_on_same_session(
+        self, monkeypatch, client_module, session_module, instantiations, load_plugin_module
+    ):
+        convert = load_plugin_module("convert")
+        second_reply = "I see it"
+        script = [
+            [
+                [
+                    AssistantMessage(content=[TextBlock(text=FIRST_REPLY_TEXT)]),
+                    ResultMessage(is_error=False, result=FIRST_REPLY_TEXT),
+                ],
+                [
+                    AssistantMessage(content=[TextBlock(text=second_reply)]),
+                    ResultMessage(is_error=False, result=second_reply),
+                ],
+            ]
+        ]
+        calls_log = _install_fake_session(
+            monkeypatch, client_module, session_module, instantiations, session_scripts=script
+        )
+        client = _make_client(client_module)
+        _first_call(client)
+
+        second = client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[
+                SYSTEM,
+                FIRST_USER,
+                {"role": "assistant", "content": FIRST_REPLY_TEXT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what's this?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                },
+            ],
+            extra_body={"hermes_session_id": "warm-1"},
+        )
+        assert second.choices[0].finish_reason == "stop"
+        assert second.choices[0].message.content == second_reply
+
+        # Same underlying SdkSession — no second SdkSession() instantiation
+        # (warm detection still works via the assistant-text comparison,
+        # which is unaffected by the new message's content type).
+        assert len(instantiations) == 1
+        assert calls_log[-1][0] == "run_turn"
+        prompt = calls_log[-1][1]
+        assert isinstance(prompt, convert.StreamPrompt)
+        assert prompt.image_count == 1
+
+
 class TestClientCloseCleansIdleSessions:
     def test_close_cancels_idle_timers_and_closes_sessions(
         self, monkeypatch, client_module, session_module, instantiations

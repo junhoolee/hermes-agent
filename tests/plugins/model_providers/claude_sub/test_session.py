@@ -177,6 +177,50 @@ class TestRunTurn:
             session.close()
 
 
+class TestPromptPassthrough:
+    """v0.1-G: ``run_turn`` forwards its *prompt* argument to ``client.query()``
+    completely unchanged — a stream-json-frame async-iterable (``convert.StreamPrompt``,
+    or any object with ``__aiter__``) must reach the fake client as the exact same
+    object, not a stringified/converted copy."""
+
+    def test_async_iterable_prompt_reaches_query_unconverted(
+        self, load_plugin_module, fake_client_factory
+    ):
+        class _FakeStreamPrompt:
+            def __aiter__(self):
+                async def _gen():
+                    yield {"type": "user", "message": {"role": "user", "content": []}}
+
+                return _gen()
+
+        factory, holder = fake_client_factory
+        session = _session(load_plugin_module, factory)
+        session.ensure_started()
+        holder[0].messages_factory = lambda: ["m1"]
+        prompt = _FakeStreamPrompt()
+        try:
+            session.run_turn(prompt, on_message=lambda _m: None, timeout=5.0)
+            assert len(holder[0].queries) == 1
+            assert holder[0].queries[0] is prompt
+        finally:
+            session.close()
+
+    def test_real_stream_prompt_reaches_query_unconverted(
+        self, load_plugin_module, fake_client_factory
+    ):
+        convert = load_plugin_module("convert")
+        factory, holder = fake_client_factory
+        session = _session(load_plugin_module, factory)
+        session.ensure_started()
+        holder[0].messages_factory = lambda: ["m1"]
+        prompt = convert.StreamPrompt([{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}])
+        try:
+            session.run_turn(prompt, on_message=lambda _m: None, timeout=5.0)
+            assert holder[0].queries[0] is prompt
+        finally:
+            session.close()
+
+
 class TestInterrupt:
     def test_request_interrupt_calls_client(self, load_plugin_module, fake_client_factory):
         factory, holder = fake_client_factory

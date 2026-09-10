@@ -2,7 +2,10 @@
 
 ``ClaudeSDKClient`` is asyncio-only; the plugin's ``ClaudeSubClient`` is
 synchronous. This module owns the bridge: one dedicated event-loop thread per
-``SdkSession``, driving a single ``ClaudeSDKClient``.
+``SdkSession``, driving a single ``ClaudeSDKClient``. The prompt passed to
+``run_turn``/``continue_turn`` is opaque here — a plain string or a
+stream-json ``AsyncIterable[dict]`` (``convert.StreamPrompt``, used when the
+turn carries an image) — and is forwarded to ``client.query()`` as-is.
 
 v0.1-B adds pause/continue: an ``on_message`` callback can raise
 ``PauseTurn`` to stop draining early (a tool-call boundary) while leaving the
@@ -219,7 +222,7 @@ class SdkSession:
 
     def run_turn(
         self,
-        prompt: str,
+        prompt: Any,
         *,
         on_message: Callable[[Any], None],
         timeout: Optional[float] = None,
@@ -227,6 +230,9 @@ class SdkSession:
         stall_exempt: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Send *prompt* (a fresh ``query()``) and drain until quiet or paused.
+
+        *prompt* is a str or a stream-json frame's ``AsyncIterable[dict]``
+        (``convert.StreamPrompt``) — passed to ``client.query()`` unchanged.
 
         Raises ``TimeoutError`` on a blown deadline or a stall, and re-raises
         whatever the SDK raised. If *on_message* raises ``PauseTurn``, this
@@ -379,7 +385,7 @@ class SdkSession:
         await client.connect()
         return client
 
-    async def _pump_turn(self, prompt: str, inbox: "queue.Queue[tuple[str, Any]]") -> None:
+    async def _pump_turn(self, prompt: Any, inbox: "queue.Queue[tuple[str, Any]]") -> None:
         client = self._client
         if client is None:
             inbox.put(("error", SdkSessionError("claude-sub session is closed.")))

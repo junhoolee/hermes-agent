@@ -1,20 +1,32 @@
 """Message <-> prompt conversion and usage accounting for claude-sub.
 
-The claude-agent-sdk session speaks one text prompt per turn, not an OpenAI
-``messages`` list. This module renders the Hermes conversation into that
-prompt — including a coldstart's prior ``tool_calls``/``tool`` history, so
-a model resuming mid-conversation can see what was already tried, with what
-arguments, and what came back, instead of repeating the same call blind —
-and turns the SDK's per-call usage dict into OpenAI-shaped token counts.
+The claude-agent-sdk session speaks one prompt per turn, not an OpenAI
+``messages`` list. That prompt is usually plain text — rendered from the
+Hermes conversation, including a coldstart's prior ``tool_calls``/``tool``
+history, so a model resuming mid-conversation can see what was already
+tried, with what arguments, and what came back, instead of repeating the
+same call blind — but when the last (or, for a warm follow-up, newest) user
+message carries an ``image_url``/``input_image`` part, it becomes a
+``StreamPrompt``: an async-iterable of one stream-json user frame carrying
+an Anthropic image block, so the SDK sends it over stdin instead of losing
+it to a ``"[image omitted]"`` placeholder. This module also turns the SDK's
+per-call usage dict into OpenAI-shaped token counts.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 BOOTSTRAP_MAX_MESSAGES = 200
 BOOTSTRAP_TOOL_ARGS_MAX_CHARS = 500
 BOOTSTRAP_TOOL_RESULT_MAX_CHARS = 2000
+
+IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+
+_DATA_URL_RE = re.compile(
+    r"^data:(?P<mime>[\w.+-]+/[\w.+-]+)?(?P<params>;[^,]*)?,(?P<data>.*)$", re.DOTALL
+)
 
 
 def _text_from_content(content: Any) -> str:
@@ -190,14 +202,190 @@ def first_user_text(messages: list[dict]) -> str:
     return ""
 
 
-def build_prompt(messages: list[dict], *, bootstrap_max_chars: int) -> str:
-    """Render Hermes ``messages`` into the single text prompt for a claude-sub turn."""
+def _image_part_block(part: dict) -> dict:
+    """Return the stream block a single image_url/input_image *part* becomes.
+
+    A ``data:`` URL becomes a base64 image block, an ``http(s)://`` URL
+    becomes a url image block, and anything else that claims to be an image
+    (a non-base64 data URL, an empty url, a bare file path, ...) becomes a
+    text block noting the image could not be encoded — it is never silently
+    dropped.
+    """
+    image_url = part.get("image_url")
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if isinstance(url, str) and url:
+        if url.startswith("http://") or url.startswith("https://"):
+            return {"type": "image", "source": {"type": "url", "url": url}}
+        match = _DATA_URL_RE.match(url) if url.startswith("data:") else None
+        if match:
+            params = match.group("params") or ""
+            data = match.group("data") or ""
+            if "base64" in params and data:
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": match.group("mime") or "image/png",
+                        "data": data.strip(),
+                    },
+                }
+    return {"type": "text", "text": "[an image was attached but could not be encoded]"}
+
+
+def image_blocks_from_content(content: Any) -> list[dict]:
+    """Extract Anthropic image blocks from an OpenAI-shaped multipart *content*.
+
+    Only ``IMAGE_PART_TYPES`` parts are considered; see ``_image_part_block``
+    for how each one is encoded (or noted as unencodable).
+    """
+    if not isinstance(content, list):
+        return []
+    return [
+        _image_part_block(part)
+        for part in content
+        if isinstance(part, dict) and part.get("type") in IMAGE_PART_TYPES
+    ]
+
+
+def _text_excluding_encoded_images(content: Any) -> str:
+    """Like ``_text_from_content`` but for a message whose image blocks ride
+    along in the same ``StreamPrompt``: an image part that was actually
+    turned into a real ``image`` block is omitted from the text entirely
+    (the block right next to it already carries the image, so asserting
+    "[image omitted]" would contradict it). A part that failed to encode
+    still gets the placeholder, since no image block represents it.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                parts.append(str(part.get("text") or ""))
+            elif part_type in IMAGE_PART_TYPES and _image_part_block(part).get("type") != "image":
+                parts.append("[image omitted]")
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+class StreamPrompt:
+    """An async-iterable stream-json user frame carrying text + image blocks.
+
+    ``ClaudeSDKClient.query()`` accepts either a plain string or an
+    ``AsyncIterable[dict]`` of raw stream-json frames; this is the latter,
+    used only when the outgoing user turn includes at least one image
+    block. Each ``__aiter__()`` call returns a fresh async generator that
+    yields a brand-new frame dict — the SDK mutates the frame it receives
+    (filling in ``session_id``), so reusing the same dict/list across a
+    retried send would leak that mutation into the resend.
+    """
+
+    def __init__(self, blocks: list[dict]) -> None:
+        self.blocks = list(blocks)
+
+    def __aiter__(self):
+        return self._frames()
+
+    async def _frames(self):
+        yield {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [dict(block) for block in self.blocks],
+            },
+            "parent_tool_use_id": None,
+        }
+
+    @property
+    def text(self) -> str:
+        """Concatenated text blocks, for logging/debugging only."""
+        return "\n".join(
+            str(block.get("text") or "")
+            for block in self.blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+
+    @property
+    def image_count(self) -> int:
+        return sum(
+            1 for block in self.blocks if isinstance(block, dict) and block.get("type") == "image"
+        )
+
+    def __repr__(self) -> str:
+        return f"StreamPrompt(text_chars={len(self.text)}, images={self.image_count})"
+
+
+def make_prompt(text: str, extra_blocks: list[dict]) -> "str | StreamPrompt":
+    """Combine *text* with *extra_blocks*, returning a str unless an image is present."""
+    image_blocks = [
+        block for block in extra_blocks if isinstance(block, dict) and block.get("type") == "image"
+    ]
+    if not image_blocks:
+        notes = [
+            str(block.get("text") or "")
+            for block in extra_blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if not notes:
+            return text
+        return "\n".join(([text] if text else []) + notes)
+    blocks: list[dict] = ([{"type": "text", "text": text}] if text else []) + list(extra_blocks)
+    return StreamPrompt(blocks)
+
+
+def build_prompt(messages: list[dict], *, bootstrap_max_chars: int) -> "str | StreamPrompt":
+    """Render Hermes ``messages`` into the prompt for a claude-sub turn.
+
+    The text portion is unchanged from before, UNLESS the last user message
+    carries at least one image part that was actually encoded into a real
+    image block — in that case its text is rendered with the "[image
+    omitted]" placeholder for that part dropped (the image block right next
+    to it already carries it), and the result is a ``StreamPrompt`` instead
+    of a plain string.
+    """
     system_text, last_user_text, prior_messages = split_messages(messages)
-    return (
+    last_user_content = None
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_content = message.get("content")
+    image_blocks = image_blocks_from_content(last_user_content)
+    if any(block.get("type") == "image" for block in image_blocks):
+        last_user_text = _text_excluding_encoded_images(last_user_content)
+    text = (
         context_prefix(system_text)
         + bootstrap_prefix(prior_messages, bootstrap_max_chars=bootstrap_max_chars)
         + last_user_text
     )
+    return make_prompt(text, image_blocks)
+
+
+def build_followup_prompt(tail_messages: list[dict]) -> "str | StreamPrompt":
+    """Render a warm follow-up's new tail messages into a prompt.
+
+    Text is joined the same way ``client.py``'s warm-followup path always
+    has (each message's flattened text, ``"\\n\\n"``-joined) — UNLESS the
+    tail carries at least one image part that was actually encoded into a
+    real image block, in which case each message's text is rendered with
+    the "[image omitted]" placeholder dropped for its encoded part(s). Image
+    parts are collected from the tail messages in order and appended as
+    image blocks.
+    """
+    image_blocks: list[dict] = []
+    for message in tail_messages:
+        if isinstance(message, dict):
+            image_blocks.extend(image_blocks_from_content(message.get("content")))
+    render_text = (
+        _text_excluding_encoded_images
+        if any(block.get("type") == "image" for block in image_blocks)
+        else _text_from_content
+    )
+    text = "\n\n".join(render_text(message.get("content")) for message in tail_messages)
+    return make_prompt(text, image_blocks)
 
 
 def _int(value: Any) -> int:
@@ -235,6 +423,11 @@ __all__ = [
     "context_prefix",
     "bootstrap_prefix",
     "build_prompt",
+    "build_followup_prompt",
+    "make_prompt",
+    "image_blocks_from_content",
+    "IMAGE_PART_TYPES",
+    "StreamPrompt",
     "usage_from_assistant",
     "text_from_content",
 ]

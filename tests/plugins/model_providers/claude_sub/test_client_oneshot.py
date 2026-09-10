@@ -260,6 +260,72 @@ class TestSessionKeyDerivation:
         assert len(a) == 16
 
 
+class TestImageInputOneShot:
+    """v0.1-G: an image_url part on the user message reaches SdkSession.run_turn as a StreamPrompt."""
+
+    def _capturing_session_factory(self, *, closed_flag, captured, reply_text="I see it"):
+        class _FakeSession:
+            def __init__(self, **_kwargs):
+                pass
+
+            def run_turn(self, prompt, *, on_message, timeout=None, stall_timeout=None, stall_exempt=None):
+                captured["prompt"] = prompt
+                on_message(AssistantMessage(content=[TextBlock(text=reply_text)]))
+                on_message(ResultMessage(is_error=False, result=reply_text))
+                return 2
+
+            def request_interrupt(self):
+                return True
+
+            def close(self):
+                closed_flag["closed"] = True
+
+        return _FakeSession
+
+    def test_image_content_produces_stream_prompt_with_image_count(
+        self, monkeypatch, client_module, closed_flag, load_plugin_module
+    ):
+        convert = load_plugin_module("convert")
+        captured: dict = {}
+        monkeypatch.setattr(
+            client_module,
+            "SdkSession",
+            self._capturing_session_factory(closed_flag=closed_flag, captured=captured),
+        )
+        client = _make_client(client_module)
+        completion = client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what's in this image?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                }
+            ],
+        )
+        assert completion.choices[0].message.content == "I see it"
+        assert isinstance(captured["prompt"], convert.StreamPrompt)
+        assert captured["prompt"].image_count == 1
+        assert closed_flag["closed"] is True
+
+    def test_text_only_content_still_produces_str_prompt(
+        self, monkeypatch, client_module, closed_flag
+    ):
+        captured: dict = {}
+        monkeypatch.setattr(
+            client_module,
+            "SdkSession",
+            self._capturing_session_factory(closed_flag=closed_flag, captured=captured),
+        )
+        client = _make_client(client_module)
+        client.chat.completions.create(
+            model="claude-sonnet-5", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert isinstance(captured["prompt"], str)
+
+
 class TestClientDefaults:
     def test_default_api_key_and_base_url(self, client_module):
         client = client_module.ClaudeSubClient()

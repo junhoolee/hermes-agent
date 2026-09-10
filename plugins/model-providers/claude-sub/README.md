@@ -6,7 +6,7 @@ Pro/Max/Team subscription without an ACP subprocess. Registers itself as an
 for the sibling pattern) and supplies its own client via
 `ProviderProfile.create_client()` — no core edits required.
 
-## Status: v0.1-F
+## Status: v0.1-G
 
 - v0.1-A (profile registration, settings, scrubbed child environment, error
   mapping, message→prompt conversion, synchronous one-shot session runner) plus:
@@ -134,6 +134,27 @@ for the sibling pattern) and supplies its own client via
     the timer already closed.
   - `ClaudeSubClient.close()` cancels every idle timer and closes every idle
     session, same as any other open turn.
+- **Image input** (v0.1-G, `convert.py`): an `image_url`/`input_image` part
+  on the turn's newest user message (the last message on a cold start, or a
+  new tail message on a warm follow-up) is no longer flattened to the text
+  placeholder `"[image omitted]"` — it is delivered as a real Anthropic
+  image block inside a stream-json user frame
+  (`{"type":"user","message":{"role":"user","content":[...]}, "parent_tool_use_id":null}`),
+  which `ClaudeSDKClient.query()` accepts as an `AsyncIterable[dict]` in
+  place of a plain string. Both `data:` URLs (decoded to a base64 image
+  block, preserving the declared mime type) and `http(s)://` URLs (passed
+  through as a url image block) are supported. Anything else that claims to
+  be an image (a non-base64 data URL, an empty url, a bare file path, ...)
+  is not silently dropped — it becomes a
+  `"[an image was attached but could not be encoded]"` text note instead.
+  Earlier turns' images, once replayed through `<prior_conversation>`
+  bootstrap history, still render as the `"[image omitted]"` text
+  placeholder (unchanged) — only the newest user turn's own image reaches
+  the model natively. `create()`'s log line grows an `images=<n>` field.
+  This is entirely independent of `supports_vision` (see `__init__.py`),
+  which governs a different thing: whether images embedded in a *tool
+  result* message reach the model — those are still flattened to text (see
+  "Known limitations" below).
 
 ## Prerequisites
 
@@ -182,7 +203,12 @@ providers:
 
 ## Known limitations (v0.1)
 
-- No image input (`supports_vision=False`).
+- The newest user message's own image reaches the model (v0.1-G, see
+  above); images replayed from earlier turns via `<prior_conversation>`
+  bootstrap history still render as `"[image omitted]"`, and images inside
+  a tool-result message are never delivered — `supports_vision=False` is an
+  accurate statement of that last fact (see `__init__.py`), not a claim
+  that no image ever reaches the model.
 - No `resume`/session-store integration across process restarts — this
   plugin never resumes a prior transcript after Hermes itself restarts. Within
   one running process, a session can be kept warm across turns (v0.1-E, see

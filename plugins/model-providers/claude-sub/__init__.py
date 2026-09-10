@@ -7,8 +7,9 @@ through :meth:`providers.base.ProviderProfile.create_client` — the same
 registration seam ``plugins/model-providers/copilot-acp/`` uses — so nothing
 in core needs to change for it to exist.
 
-v0.1-A (this card) is a tool-less, one-shot text path. Streaming, tool
-bridging, and session continuation are card B's job.
+v0.1-A was a tool-less, one-shot text path; streaming, tool bridging,
+session continuation, and (v0.1-G) image input have since been added — see
+``client.py``, ``session.py``, and ``convert.py``.
 """
 
 from __future__ import annotations
@@ -72,6 +73,12 @@ claude_sub = ClaudeSubProfile(
     base_url="claude-sub://sdk",
     env_vars=(),
     supports_health_check=False,
+    # This flag means "does this provider accept native images inside a
+    # tool-result message" (providers/base.py); this bridge's tool results
+    # are flattened to text in client.py::_resolve_pending, so flipping it
+    # to True would make tools/vision_tools.py's native fast path silently
+    # drop tool-result images. A last-user-turn image (v0.1-G) is delivered
+    # via convert.StreamPrompt regardless of this flag.
     supports_vision=False,
     fallback_models=("claude-sonnet-5", "claude-opus-5", "claude-fable-5-1"),
     process_command=_resolve_process_command(),
