@@ -40,6 +40,7 @@ not just retried with a longer timeout.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import hashlib
 import json
@@ -520,7 +521,25 @@ class _ChatCompletions:
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
-        return self._client._create_chat_completion(**kwargs)
+        """Dual-mode entry point.
+
+        Plain thread (no running event loop) -> run the SDK turn inline and
+        return the response synchronously (unchanged behaviour; this is the
+        main conversation loop, which hosts run on a worker thread).
+
+        Thread with a running event loop (the auxiliary async path:
+        ``agent/auxiliary_client.py`` ``_acreate`` does
+        ``await client.chat.completions.create(**kwargs)``) -> return an
+        awaitable that offloads the blocking SDK turn to a worker thread via
+        ``asyncio.to_thread`` so the caller's loop is never blocked.
+        ``stream=True`` takes the same path: the awaitable resolves to the
+        synchronous chunk generator.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._client._create_chat_completion(**kwargs)
+        return asyncio.to_thread(self._client._create_chat_completion, **kwargs)
 
 
 class _ChatNamespace:
@@ -531,10 +550,13 @@ class _ChatNamespace:
 class ClaudeSubClient:
     """Minimal OpenAI-client-compatible facade for the claude-sub provider."""
 
-    # HERMES_SKIP_TRANSPORT_WRAP/HERMES_SKIP_ASYNC_WRAP tell core not to
-    # re-wrap this client in a wire adapter/AsyncOpenAI. create() is
-    # synchronous; for async callers (auxiliary async_call_llm, etc.) core's
-    # own _to_async_client wraps it in a worker-thread offload facade.
+    # This shim drives an SDK subprocess directly, so it is already a
+    # complete client: never re-dispatch it through a wire adapter, and do
+    # not wrap it in AsyncOpenAI (the marker base_url is not HTTP). The core
+    # therefore hands this same object to async consumers, and
+    # ``_ChatCompletions.create`` is dual-mode: synchronous on a plain
+    # thread, an ``asyncio.to_thread`` awaitable when the calling thread has
+    # a running event loop.
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 

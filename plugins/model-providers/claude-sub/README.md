@@ -228,6 +228,12 @@ providers:
   multi-tool-call turn (`tool_calls` → continuation → `tool_calls` →
   continuation → ...) stays on the same session/turn until the final `stop`;
   only a genuinely new or mismatched user turn opens a new one.
+- Async / auxiliary path: because `HERMES_SKIP_ASYNC_WRAP` makes core's
+  `_to_async_client` return this object unchanged, `create()` is dual-mode —
+  synchronous on a plain thread, an `asyncio.to_thread` awaitable when the
+  calling thread has a running event loop. Cancelling that awaitable does not
+  stop the underlying SDK turn, which keeps running to completion on its
+  worker thread.
 
 ## E2E reproduction
 
