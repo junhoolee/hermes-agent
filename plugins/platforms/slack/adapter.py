@@ -3003,6 +3003,40 @@ class SlackAdapter(BasePlatformAdapter):
             zw = "\u200b" if inner and not (inner[-1].isalnum() or inner[-1] == "_") else ""
             return _ph(f"*{inner}{zw}*")
 
+        # Wrap remaining bare URLs (not already part of a markdown link or an
+        # existing <url> entity — both already protected above) in explicit
+        # <url> Slack link syntax before any emphasis conversion. Without
+        # this, a bare URL sitting directly against a markdown delimiter
+        # (e.g. "**https://example.com/path**", no space before the closing
+        # **) leaves the literal characters "https://.../path**" in the
+        # outgoing text. Slack's own bare-URL autolinker then treats the
+        # trailing "*" as part of the URL (it's a valid path/query
+        # character), producing a broken link that 404s or redirects
+        # somewhere unintended, while the "*" pair no longer closes as bold.
+        # Wrapping here — and protecting the result as a placeholder — makes
+        # the URL boundary explicit so later bold/italic passes can't extend
+        # into it, and reuses the existing zero-width-space handling in
+        # _convert_bold above for the placeholder-adjacent "*" case.
+        def _strip_url_trailing_punct(url: str) -> Tuple[str, str]:
+            trailing = ""
+            while url:
+                ch = url[-1]
+                if ch in ")]}":
+                    opener = {"}": "{", "]": "[", ")": "("}[ch]
+                    if url.count(opener) >= url.count(ch):
+                        break  # balanced (or more opens) — likely part of the URL itself
+                elif ch not in "*_~'\".,;:!?":
+                    break
+                trailing = ch + trailing
+                url = url[:-1]
+            return url, trailing
+
+        def _wrap_bare_url(m):
+            url, trailing = _strip_url_trailing_punct(m.group(0))
+            if not url:
+                return m.group(0)
+            return _ph(f"<{url}>") + trailing
+
         # Ordered passes: protect code/links/entities/quotes, escape, then convert emphasis.
         # Escaping unescapes first in ONE regex pass (sequential replaces would decode
         # "&amp;lt;" twice). ``None`` marks the escape step.
@@ -3012,6 +3046,7 @@ class SlackAdapter(BasePlatformAdapter):
             (r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
             (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", lambda m: _ph(m.group(1)), 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),
+            (r"https?://[^\s<>\x00]+", _wrap_bare_url, 0),
             None,
             (r"^#{1,6}\s+(.+)$", _convert_header, re.MULTILINE),
             (r"\*\*\*(.+?)\*\*\*", lambda m: _ph(f"*_{m.group(1)}_*"), 0),
