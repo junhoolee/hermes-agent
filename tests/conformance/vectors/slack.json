@@ -2,7 +2,7 @@
   "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_conformance_vectors.py; the native renderers are the oracle (executable spec).",
   "oracle": {
     "repo": "NousResearch/hermes-agent",
-    "commit": "40eebc7d70f3d8e95c429c8aa482f31ba6c867f6",
+    "commit": "ee34bc0a03b68e20824c2819030ca25f4560e3a4",
     "generator": "scripts/generate_conformance_vectors.py",
     "generator_version": 1
   },
@@ -160,7 +160,7 @@
       "category": "grid",
       "expect": "parity",
       "input": "Visit https://example.com/path?q=1&r=2 today.",
-      "native_output": "Visit https://example.com/path?q=1&amp;r=2 today."
+      "native_output": "Visit <https://example.com/path?q=1&r=2> today."
     },
     {
       "id": "mixed-document",

@@ -87,6 +87,11 @@ from hermes_cli.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
+from hermes_cli.claude_code import (
+    CLAUDE_CODE_BASE_URL,
+    CLAUDE_CODE_DISPLAY_NAME,
+    CLAUDE_CODE_PROVIDER_ID,
+)
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
@@ -304,6 +309,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    # Claude subscription via the official Claude Agent SDK. No
+    # api_key_env_vars and no base_url_env_var on purpose: Hermes holds no
+    # Claude credential and the SDK owns the transport.
+    "claude-code": ProviderConfig(
+        id=CLAUDE_CODE_PROVIDER_ID,
+        name=CLAUDE_CODE_DISPLAY_NAME,
+        auth_type="external_process",
+        inference_base_url=CLAUDE_CODE_BASE_URL,
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -578,6 +592,24 @@ try:
     from providers import list_providers as _list_providers_for_registry
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
+            continue
+        if _pp.auth_type == "external_process":
+            # An external-process provider (an ACP CLI driven over stdio) has no
+            # API-key env vars to resolve — its credentials come from
+            # resolve_external_process_provider_credentials(), keyed on this
+            # auth_type. Registering it here is what lets a provider shipped
+            # outside this tree pass resolve_provider()'s known-provider gate;
+            # without it, `hermes -m <that provider>` dies with
+            # "Unknown provider" before any client is ever built.
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name,
+                name=_pp.display_name or _pp.name,
+                auth_type="external_process",
+                inference_base_url=_pp.base_url,
+            )
+            for _alias in _pp.aliases:
+                if _alias not in PROVIDER_REGISTRY:
+                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
             continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
@@ -2277,7 +2309,7 @@ def resolve_provider(
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
-        "claude": "anthropic", "claude-code": "anthropic",
+        "claude": "anthropic",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
@@ -2310,7 +2342,25 @@ def resolve_provider(
                     _PROVIDER_ALIASES[_alias] = _pp.name
     except Exception:
         pass
-    normalized = _PROVIDER_ALIASES.get(normalized, normalized)
+    # `claude-code` / `claude-oauth` used to be aliases of `anthropic`. They are
+    # now the Claude Agent SDK provider's own slugs, but only once the user opts
+    # in — until then the legacy mapping stays live so an existing config keeps
+    # resolving instead of erroring out on an "unknown provider".
+    _requested_slug = normalized
+    try:
+        from hermes_cli.claude_code import legacy_alias_target
+        _legacy_target = legacy_alias_target(normalized)
+    except Exception:
+        _legacy_target = None
+    normalized = _legacy_target or _PROVIDER_ALIASES.get(normalized, normalized)
+
+    # One-time notice when the resolved setup still bills through the direct
+    # Claude OAuth path. Never blocks and never changes the resolution.
+    try:
+        from hermes_cli.claude_code import warn_legacy_provider_once
+        warn_legacy_provider_once(_requested_slug)
+    except Exception:
+        pass
 
     if normalized == "openrouter":
         return "openrouter"
@@ -7349,6 +7399,29 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
+    if provider_id == CLAUDE_CODE_PROVIDER_ID:
+        # Official CLI probe (`claude auth status` / `claude --version`), never
+        # a credential-file read. Degrades to an "unknown" status rather than
+        # raising, so a missing or wedged CLI cannot break the provider list.
+        from hermes_cli.claude_code import provider_status as _claude_provider_status
+
+        try:
+            return _claude_provider_status(pconfig.name)
+        except Exception as exc:
+            logger.debug("claude-code status probe failed: %s", exc)
+            return {
+                "configured": False,
+                "provider": provider_id,
+                "name": pconfig.name,
+                "command": "claude",
+                "args": [],
+                "resolved_command": None,
+                "base_url": pconfig.inference_base_url,
+                "logged_in": False,
+                "status": "unknown",
+                "message": f"Could not determine Claude login state: {exc}",
+            }
+
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -7390,7 +7463,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", CLAUDE_CODE_PROVIDER_ID}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7576,29 +7649,81 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
+    if provider_id == CLAUDE_CODE_PROVIDER_ID:
+        # Deliberately returns NO credential material. The Claude Agent SDK
+        # resolves the user's login itself; Hermes never holds, forwards, or
+        # refreshes a Claude token. ``api_key`` is empty rather than a marker
+        # so nothing downstream can mistake it for a usable secret.
+        from hermes_cli.claude_code import CLAUDE_LOGIN_COMMAND
+
+        status = get_external_process_provider_status(provider_id)
+        if not status.get("resolved_command"):
+            raise AuthError(
+                "Could not find the `claude` CLI. Install Claude Code, then run "
+                f"`{CLAUDE_LOGIN_COMMAND}`.",
+                provider=provider_id,
+                code="missing_claude_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "",
+            "base_url": CLAUDE_CODE_BASE_URL,
+            "command": status.get("resolved_command") or "claude",
+            "args": [],
+            "credentials_owner": "claude-agent-sdk",
+            "source": "claude_agent_sdk",
+        }
+
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    # How to launch the CLI comes from the provider's own profile, so a provider
+    # shipped outside this tree describes its binary/args instead of inheriting
+    # another vendor's. copilot-acp's values live in its profile, which is why
+    # HERMES_COPILOT_ACP_COMMAND / COPILOT_CLI_PATH / HERMES_COPILOT_ACP_ARGS
+    # keep working unchanged.
+    profile = None
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+
+        profile = _get_provider_profile(provider_id)
+    except Exception:
+        profile = None
+
+    command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
+    default_command = str(getattr(profile, "process_command", "") or "")
+    default_args = list(getattr(profile, "process_args", ()) or [])
+    args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
+
+    command = ""
+    for _var in command_env_vars:
+        command = os.getenv(_var, "").strip()
+        if command:
+            break
+    if not command:
+        command = default_command
+
+    raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
+    args = shlex.split(raw_args) if raw_args else list(default_args)
+
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        _hint = (
+            " or set " + "/".join(command_env_vars) if command_env_vars else ""
+        )
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the '{provider_id}' CLI command "
+            f"'{command or '(none configured)'}'. Install it{_hint}.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_process_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        # Placeholder credential: the subprocess owns real auth. Keyed on the
+        # provider id so each external-process provider gets a distinct value.
+        "api_key": pconfig.id or provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

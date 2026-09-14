@@ -1,0 +1,116 @@
+"""Release gate for the "Claude subscription via Agent SDK" runtime.
+
+The runtime ships default-off because Anthropic's Agent SDK overview states
+that third party developers may not offer claude.ai login or rate limits for
+their products without prior approval, while their Help Center simultaneously
+says SDK usage still draws from subscription limits — an unresolved tension.
+Until Anthropic confirms in writing, only a developer running private
+validation on their own consenting account may flip this on; see
+`docs/design/claude-subscription-via-agent-sdk.md` for the full record.
+
+This module is imported by the provider catalog and the dashboard web server,
+so it must stay dependency-light and must never raise at import time.
+"""
+
+from __future__ import annotations
+
+import functools
+import importlib.util
+from typing import Any, Optional
+
+# Pinned floors, recorded here so the runtime, the `hermes doctor` probe, and
+# the packaging extra all read the same numbers. `claude-agent-sdk` ships the
+# Claude executable inside its platform wheels, so the SDK floor also fixes a
+# CLI floor; a separately installed newer CLI is fine, an older one is not.
+CLAUDE_AGENT_SDK_MIN_VERSION = "0.2.140"
+CLAUDE_CLI_MIN_VERSION = "2.1.220"
+
+_CONFIG_SECTION = "claude_subscription"
+
+
+def claude_subscription_enabled(config: Optional[dict] = None) -> bool:
+    """True when `claude_subscription.enabled` is explicitly set in config.
+
+    Tolerates a missing, empty, or partially-shaped config dict: anything
+    that isn't an explicit truthy `enabled` reads as off. Callers pass the
+    already-loaded config rather than loading one, so the gate is usable from
+    all three config loaders (CLI, `load_config()`, raw gateway YAML).
+    """
+    if not isinstance(config, dict):
+        return False
+    section: Any = config.get(_CONFIG_SECTION)
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
+def claude_subscription_start_timeout(config: Optional[dict] = None) -> Optional[float]:
+    """The configured `claude_subscription.start_timeout` seconds, or None.
+
+    None means "use the runtime default" (``DEFAULT_START_TIMEOUT_SECONDS``
+    in :mod:`agent.transports.claude_agent_session`). Tolerates a missing,
+    empty, or malformed value the same way the gate does: anything that is
+    not a positive number reads as unset, so a hand-edited config.yaml can
+    never wedge session startup.
+    """
+    if not isinstance(config, dict):
+        return None
+    section: Any = config.get(_CONFIG_SECTION)
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("start_timeout")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+# Default idle window before the gateway reclaims a cached agent's
+# claude_agent_sdk session (claude CLI child process + event-loop thread)
+# independently of the agent's own cache-eviction TTL.
+DEFAULT_IDLE_SESSION_TTL_SECONDS = 1800.0
+
+
+def claude_subscription_idle_session_ttl(config: Optional[dict] = None) -> float:
+    """The configured `claude_subscription.idle_session_ttl_secs` seconds.
+
+    Governs how long a cached agent's claude_agent_sdk session may sit idle
+    before the gateway's idle sweep detaches and closes it, independent of
+    the surrounding AIAgent's own agent-cache TTL — a warm claude CLI child
+    process otherwise survives as long as the cached agent does, which for a
+    `session_reset: none`/long-lived conversation is effectively forever.
+    Tolerates a missing, empty, or malformed value the same way the other
+    accessors here do, falling back to ``DEFAULT_IDLE_SESSION_TTL_SECONDS``.
+    Returns 0.0 (reclaim disabled) when the configured value is zero or
+    negative — an explicit opt-out, not a misconfiguration.
+    """
+    if not isinstance(config, dict):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    section: Any = config.get(_CONFIG_SECTION)
+    if not isinstance(section, dict):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    raw = section.get("idle_session_ttl_secs")
+    if isinstance(raw, bool) or raw is None:
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_IDLE_SESSION_TTL_SECONDS
+    return value if value > 0 else 0.0
+
+
+@functools.lru_cache(maxsize=1)
+def claude_agent_sdk_available() -> bool:
+    """True when `claude_agent_sdk` is importable in this interpreter.
+
+    Uses `find_spec` rather than a real import: the package is an ~80 MB
+    wheel that bundles the Claude executable, and every caller only needs to
+    know whether the optional `claude-code` extra is installed.
+    """
+    try:
+        return importlib.util.find_spec("claude_agent_sdk") is not None
+    except (ImportError, ValueError):
+        return False

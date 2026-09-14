@@ -1,0 +1,5 @@
+name: claude-sub-provider
+kind: model-provider
+version: 0.1.0
+description: Claude Pro/Max/Team subscription via claude-agent-sdk (out-of-tree plugin)
+author: Junhoo Lee / Hermes orchestrator + sonnet-coder

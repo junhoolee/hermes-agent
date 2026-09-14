@@ -4052,6 +4052,25 @@ DEFAULT_CONFIG = {
         "detect_ports": [],
     },
 
+    # "Claude subscription via Agent SDK" runtime (provider "claude-code",
+    # api_mode "claude_agent_sdk"). A top-level root rather than a key under
+    # `model` because DEFAULT_CONFIG's `model` is a plain string here (only
+    # cli.py's CLI defaults shape it as a dict), so a nested key would be
+    # invisible to load_config() and to the gateway's raw-YAML reader.
+    # Read through hermes_cli/claude_subscription.py, never inline.
+    "claude_subscription": {
+        # Default-off pending written policy clearance from Anthropic; see
+        # docs/design/claude-subscription-via-agent-sdk.md. Flipping this on
+        # is only sanctioned for private validation against a
+        # developer-controlled, consenting Claude account.
+        "enabled": False,
+        # Seconds the runtime waits for the Claude CLI child to spawn,
+        # connect, and (on resume) re-materialize the mirrored transcript.
+        # 0 = the built-in default (60s). Raise on slow hardware where a
+        # cold resume of a large session exceeds a minute.
+        "start_timeout": 0,
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 39,
 }

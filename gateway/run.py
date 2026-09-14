@@ -3105,6 +3105,21 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+
+def _close_claude_sdk_session_safely(session: Any) -> None:
+    """Close a detached claude_agent_sdk session, swallowing failures.
+
+    Runs on its own daemon thread from ``_sweep_idle_cached_agents`` — the
+    close can take a few seconds tearing down the claude CLI subprocess and
+    the event-loop thread, so it must never happen on the sweep's own
+    thread or while holding ``_agent_cache_lock``.
+    """
+    try:
+        session.close()
+    except Exception:
+        logger.debug("claude_agent_sdk idle session close failed", exc_info=True)
+
+
 # Conversation-scoped per-session state registry (legacy contract).
 # The state itself now lives in ``SessionState.conversation`` (see
 # gateway/session_state.py) and boundaries clear it structurally via
@@ -3391,6 +3406,21 @@ def _deep_merge_request_overrides(base: Optional[dict], override: Optional[dict]
     if not override_dict:
         return base_dict
     return _deep_merge(base_dict, override_dict)
+
+
+def _runtime_is_keyless(runtime_kwargs: Optional[dict]) -> bool:
+    """True when the resolved runtime legitimately carries no API key.
+
+    The Claude subscription runtime (``api_mode="claude_agent_sdk"``) holds
+    no credential by contract — the Agent SDK resolves the user's own login
+    (see hermes_cli/runtime_provider.py).  An empty ``api_key`` alone
+    therefore does not mean "no provider configured", and every gateway
+    surface that refuses work on a missing key must consult this predicate
+    first (manual /compress, session hygiene, background tasks).
+    """
+    from hermes_cli.claude_code import CLAUDE_CODE_API_MODE
+
+    return (runtime_kwargs or {}).get("api_mode") == CLAUDE_CODE_API_MODE
 
 
 def _credential_pool_for_provider(provider: Optional[str]):
@@ -21190,7 +21220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _hyg_codex_auto,
                                 f"{_approx_tokens:,}",
                             )
-                        elif _hyg_runtime.get("api_key"):
+                        elif _hyg_runtime.get("api_key") or _runtime_is_keyless(_hyg_runtime):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
                             # compressor: tool results are usually the bulk of
@@ -22002,6 +22032,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
                                         )
+                        else:
+                            # Never skip silently: an over-threshold session
+                            # that hygiene cannot compress must leave a trace,
+                            # or it just keeps growing with no compress /
+                            # failure / rotation log at all (2026-08-09
+                            # incident: the keyless Claude subscription
+                            # runtime tripped this gate every turn without a
+                            # single line of evidence).
+                            logger.warning(
+                                "Session hygiene: skipping compression for %s "
+                                "— resolved runtime (provider=%s api_mode=%s) "
+                                "has no API key and is not a recognized "
+                                "keyless runtime",
+                                session_entry.session_id,
+                                _hyg_runtime.get("provider") or "",
+                                _hyg_runtime.get("api_mode") or "",
+                            )
 
                     except Exception as e:
                         logger.warning(
@@ -24513,7 +24560,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 user_config=user_config,
             )
-            if not runtime_kwargs.get("api_key"):
+            if not runtime_kwargs.get("api_key") and not _runtime_is_keyless(
+                runtime_kwargs
+            ):
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -28574,6 +28623,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Failed to release active session slot", exc_info=True
                     )
+            # A mid-turn _evict_cached_agent() call couldn't soft-release
+            # this agent (it was still running), so it flagged the agent
+            # instead and deferred the release to right here, the turn's
+            # actual end. Run it now, on a daemon thread — release_clients()
+            # can do socket teardown we must not do on the gateway's own
+            # request thread. Skip if the agent has since been re-cached
+            # (e.g. the eviction lost a race with a fresh cache insert for
+            # the same session) — that agent must stay alive.
+            _turn_agent = state.turn.agent
+            if (
+                _turn_agent is not None
+                and _turn_agent is not _AGENT_PENDING_SENTINEL
+                and getattr(_turn_agent, "_gateway_deferred_soft_release", False)
+            ):
+                _cache = getattr(self, "_agent_cache", None)
+                _cache_lock = getattr(self, "_agent_cache_lock", None)
+                _recached = False
+                if _cache is not None and _cache_lock is not None:
+                    with _cache_lock:
+                        _recached = any(
+                            isinstance(entry, tuple) and entry and entry[0] is _turn_agent
+                            for entry in _cache.values()
+                        )
+                if not _recached:
+                    _turn_agent._gateway_deferred_soft_release = False
+                    try:
+                        threading.Thread(
+                            target=self._release_evicted_agent_soft,
+                            args=(_turn_agent,),
+                            daemon=True,
+                            name=f"agent-deferred-evict-{str(session_key)[:24]}",
+                        ).start()
+                    except Exception:
+                        try:
+                            self._release_evicted_agent_soft(_turn_agent)
+                        except Exception:
+                            pass
             # One structured reset instead of the old drifting pop-list
             # (agent / started_ts / lease / busy_ack_ts).  Turn-lease tokens
             # are deliberately NOT cleared here — _release_turn_lease owns
@@ -29149,12 +29235,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Don't tear down an agent that's actively mid-turn — its client,
         # sandbox and child subagents are in use by the running request.
+        # The soft release isn't skipped outright though: it's deferred to
+        # turn end (_release_running_agent_state), because a mid-turn evict
+        # (e.g. a fallback tier switching models) otherwise pops the agent
+        # out of _agent_cache with nothing left holding a reference to it —
+        # release_clients() / _release_claude_agent_sdk_session() never run,
+        # and the orphaned claude_agent_sdk session's daemon event-loop
+        # thread pins both the Python object and its claude CLI subprocess
+        # forever (#93441).
         running_ids = {
             id(a)
             for _, a in self._running_agent_items()
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
         if id(agent) in running_ids:
+            agent._gateway_deferred_soft_release = True
+            logger.debug(
+                "Agent evicted mid-turn for session %s; soft release deferred to turn end",
+                session_key,
+            )
             return
 
         try:
@@ -29582,7 +29681,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
         now = time.time()
         idle_ttl = self._agent_cache_idle_ttl()
+        try:
+            from hermes_cli.claude_subscription import (
+                claude_subscription_idle_session_ttl,
+            )
+
+            claude_ttl = claude_subscription_idle_session_ttl(_load_gateway_config())
+        except Exception:
+            from hermes_cli.claude_subscription import (
+                DEFAULT_IDLE_SESSION_TTL_SECONDS as claude_ttl,
+            )
         to_evict: List[tuple] = []
+        # (key, session, idle_secs) — agents that keep their cache entry but
+        # whose claude_agent_sdk session (claude CLI child + event-loop
+        # thread) has outlived claude_subscription.idle_session_ttl_secs.
+        # Detached here, closed on a daemon thread below: session.close()
+        # can take a few seconds tearing down the subprocess and must not
+        # block this sweep or hold _agent_cache_lock.
+        to_close_claude: List[tuple] = []
         running_ids = {
             id(a)
             for _, a in self._running_agent_items()
@@ -29598,7 +29714,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None:
                     continue
-                if (now - last_activity) > idle_ttl:
+                idle_secs = now - last_activity
+                evicted_this_agent = False
+                if idle_secs > idle_ttl:
                     # Check whether the session has actually expired in the
                     # session store.  If it hasn't (e.g. daily-reset mode
                     # where the reset fires hours after the user's last
@@ -29637,10 +29755,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and _store.is_session_finalizable(session_entry)
                         and not _store._is_session_expired(session_entry)
                     ):
-                        continue  # keep agent — finite session hasn't expired
-                    to_evict.append((key, agent))
+                        pass  # keep agent — finite session hasn't expired
+                    else:
+                        to_evict.append((key, agent))
+                        evicted_this_agent = True
+                # The agent itself may be staying in cache (idle TTL not
+                # reached, or deferred above pending session finalization) —
+                # but its claude_agent_sdk session has its own, usually much
+                # shorter, TTL. Reclaim that independently so a long-lived
+                # cached agent doesn't pin a warm claude CLI subprocess for
+                # its entire cache lifetime (up to _AGENT_CACHE_IDLE_TTL_SECS,
+                # hours for a `session_reset: none` conversation). Detach
+                # only — never close — while holding the lock; close() can
+                # block for seconds tearing down the subprocess.
+                if not evicted_this_agent and (
+                    claude_ttl > 0
+                    and idle_secs > claude_ttl
+                    and getattr(agent, "_claude_session", None) is not None
+                ):
+                    try:
+                        claude_session = agent._detach_claude_agent_sdk_session()
+                    except Exception:
+                        claude_session = None
+                    if claude_session is not None:
+                        to_close_claude.append((key, claude_session, idle_secs))
             for key, _ in to_evict:
                 _cache.pop(key, None)
+        for key, session, idle_secs in to_close_claude:
+            logger.info(
+                "claude_agent_sdk idle session released: session=%s (idle=%.0fs, ttl=%.0fs)",
+                key, idle_secs, claude_ttl,
+            )
+            threading.Thread(
+                target=_close_claude_sdk_session_safely,
+                args=(session,),
+                daemon=True,
+                name=f"claude-sdk-idle-{key[:24]}",
+            ).start()
         for key, agent in to_evict:
             logger.info(
                 "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",

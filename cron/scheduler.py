@@ -5204,12 +5204,13 @@ def _delivery_platform_routed_from_primary_gateway(platform_name: str) -> bool:
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
-    ``local``/``origin`` (and the ``all`` routing token) need no gateway
-    credentials and are never checked — a deliver=local job must not pay a
-    gateway-config load. For concrete platform targets, an unknown platform
-    always blocks; a known platform additionally blocks when the gateway
-    config is loadable and reports it unconnected (enabled + credentials —
-    the same source `cron_delivery_targets` uses). Gateway-config load
+    ``none``/``local``/``origin`` (and the ``all`` routing token) need no
+    gateway credentials and are never checked — a no-delivery/local job must
+    not pay a gateway-config load. For concrete platform targets, an unknown
+    platform always blocks; a known platform additionally blocks when the
+    gateway config is loadable and reports it unconnected (enabled +
+    credentials — the same source `cron_delivery_targets` uses).
+    Gateway-config load
     failures fail OPEN so a transient config hiccup never wedges delivery
     that would have worked.
     """
@@ -5217,7 +5218,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     platform_parts: list[str] = []
     for part in deliver_value.split(","):
         part = part.strip()
-        if not part or part.lower() in {"local", "origin", "all"}:
+        if not part or part.lower() in {"none", "local", "origin", "all"}:
             continue
         # bot-chat targets need no gateway credentials — they deliver via a
         # local chat subprocess. Unknown-profile failures surface per run in

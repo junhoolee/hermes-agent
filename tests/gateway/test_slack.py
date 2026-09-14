@@ -2677,6 +2677,39 @@ class TestFormatMessage:
         )
         assert result == "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>"
 
+    def test_bare_bold_url_does_not_swallow_closing_asterisk(self, adapter):
+        """A bare URL directly against **bold** must not eat the closing "**".
+
+        Regression: without wrapping the bare URL in <...> ourselves, the
+        literal text "https://.../id**" reached Slack, whose own bare-URL
+        autolinker treats "*" as a valid URL character and absorbs the
+        closing bold delimiter into the link — producing a broken URL (extra
+        "*" in the path, wrong redirect) and an unclosed "*" left dangling.
+        """
+        result = adapter.format_message(
+            "**https://app.notion.com/p/OCR-3bcbdf641e4c803a8dd0f1fd0669250d**"
+        )
+        assert "50d**" not in result
+        assert "50d*>" not in result
+        assert "<https://app.notion.com/p/OCR-3bcbdf641e4c803a8dd0f1fd0669250d>" in result
+
+    def test_bare_url_wrapped_in_angle_brackets(self, adapter):
+        """A plain bare URL with no markdown around it still becomes a real Slack link."""
+        result = adapter.format_message("Check https://example.com for details.")
+        assert result == "Check <https://example.com> for details."
+
+    def test_bare_url_with_balanced_parens_not_truncated(self, adapter):
+        """Same balanced-parens rule as markdown links applies to bare URLs."""
+        result = adapter.format_message(
+            "See https://en.wikipedia.org/wiki/Bold_(text)."
+        )
+        assert result == "See <https://en.wikipedia.org/wiki/Bold_(text)>."
+
+    def test_bare_url_inside_existing_angle_brackets_unaffected(self, adapter):
+        """A URL already in Slack <url> form is untouched by the bare-URL pass."""
+        result = adapter.format_message("Already linked: <https://example.com|label>")
+        assert result == "Already linked: <https://example.com|label>"
+
 
     # --- Entity preservation (spec-compliance) ---
 

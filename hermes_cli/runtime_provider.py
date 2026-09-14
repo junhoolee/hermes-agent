@@ -40,6 +40,11 @@ from hermes_cli.auth import (
     is_actual_local_base_url,
     normalize_actual_base_url,
 )
+from hermes_cli.claude_code import (
+    CLAUDE_CODE_API_MODE,
+    CLAUDE_CODE_BASE_URL,
+    CLAUDE_CODE_PROVIDER_ID,
+)
 from hermes_cli import config as _config_mod
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
 from hermes_constants import OPENROUTER_BASE_URL
@@ -1952,6 +1957,33 @@ def _resolve_explicit_runtime(
     return None
 
 
+def _is_external_process_provider(provider: str) -> bool:
+    """Whether ``provider`` is declared as an external-process (CLI) provider.
+
+    Reads the CLI provider registry first (which now absorbs registered
+    ProviderProfiles, in-tree and out), then falls back to the profile registry
+    directly so the check works before the CLI registry has been extended.
+    """
+    name = (provider or "").strip().lower()
+    if not name:
+        return False
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get(name)
+        if pconfig is not None:
+            return pconfig.auth_type == "external_process"
+    except Exception:
+        pass
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(name)
+    except Exception:
+        return False
+    return profile is not None and getattr(profile, "auth_type", "") == "external_process"
+
+
 def resolve_runtime_provider(
     *,
     requested: Optional[str] = None,
@@ -2337,10 +2369,35 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
-    if provider == "copilot-acp":
+    if provider == CLAUDE_CODE_PROVIDER_ID:
+        # The Claude subscription runtime. The credential lookup is called for
+        # its *validation* only — it raises an actionable AuthError when the
+        # `claude` CLI is missing — because the bundle it returns deliberately
+        # carries no credential: the Agent SDK resolves the user's own login.
+        # Every non-interactive surface (cron, ACP, batch, delegation) reaches
+        # the runtime through here, so without this branch they fall back to
+        # `anthropic` and silently resume the pre-SDK direct-OAuth billing path.
         creds = resolve_external_process_provider_credentials(provider)
         return {
-            "provider": "copilot-acp",
+            "provider": CLAUDE_CODE_PROVIDER_ID,
+            "api_mode": CLAUDE_CODE_API_MODE,
+            "base_url": CLAUDE_CODE_BASE_URL,
+            # Empty by contract, not by accident — see hermes_cli/auth.py.
+            "api_key": "",
+            "credentials_owner": creds.get("credentials_owner", "claude-agent-sdk"),
+            "command": creds.get("command", ""),
+            "args": [],
+            "source": creds.get("source", "claude_agent_sdk"),
+            "requested_provider": requested_provider,
+        }
+
+    # External-process providers (an agent CLI driven over stdio, e.g. ACP).
+    # Keyed on the registered provider's auth_type rather than on one name, so a
+    # provider shipped outside this tree lands on the same credential path.
+    if _is_external_process_provider(provider):
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": provider,
             "api_mode": "chat_completions",
             "base_url": creds.get("base_url", "").rstrip("/"),
             "api_key": creds.get("api_key", ""),
